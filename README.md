@@ -1,4 +1,4 @@
-# tiss-quickreg
+# TISS Quantum Registration
 
 Headless, fast registration for [TISS](https://tiss.tuwien.ac.at) (TU Wien): **LVA**, **group** and **exam** registrations.
 It is a browser-free take on the
@@ -22,13 +22,13 @@ A redirect in response to a POST means TISS rejected it (stale ViewState, not op
 ## Setup (VPS)
 
 ```bash
-git clone <your-repo> tiss-quickreg && cd tiss-quickreg
+git clone https://github.com/closbichler/tiss-quantum-registration.git && cd tiss-quantum-registration
 python3 -m venv .venv && .venv/bin/pip install -e .
 cp config.example.toml config.toml   # edit target / schedule
 ```
 
 Make sure the VPS clock is NTP-synced (`timedatectl`). The tool also measures the TISS clock itself:
-`.venv/bin/tissreg clock`.
+`.venv/bin/tissqr clock`.
 
 ## Cookies
 
@@ -47,23 +47,23 @@ The tool needs `TISS_AUTH`, `_tiss_session` and `JSESSIONID`. If you also export
 
 ```bash
 # 1. read-only check: cookies valid? course/semester right? option found? start time? clock offset?
-.venv/bin/tissreg check -c config.toml
+.venv/bin/tissqr check -c config.toml
 
 # 2. safe rehearsal on a registration that is already open (no POST at all):
-.venv/bin/tissreg run -c config.toml --now --dry-run
+.venv/bin/tissqr run -c config.toml --now --dry-run
 #    goes one step further: clicks "Anmelden" but does NOT confirm (the confirmation page is not binding)
-.venv/bin/tissreg run -c config.toml --now --dry-run=confirm
+.venv/bin/tissqr run -c config.toml --now --dry-run=confirm
 
 # 3. the real thing - start it any time before the opening, it waits by itself:
-tmux new -s tiss '.venv/bin/tissreg run -c config.toml'
-#    or: nohup .venv/bin/tissreg run -c config.toml > /dev/null 2>&1 &
+tmux new -s tiss '.venv/bin/tissqr run -c config.toml'
+#    or: nohup .venv/bin/tissqr run -c config.toml > /dev/null 2>&1 &
 ```
 
 If `schedule.start` is not set, the start time is read from the page ("Anmeldebeginn").
 
 Exit codes: `0` registered / already registered / dry run OK, `1` failed, `2` not logged in or config error, `3` waiting list.
 
-Logs go to `logs/tissreg-<timestamp>.log` (millisecond timestamps). With `save_html = true`, every relevant HTML response is stored in `logs/<timestamp>/` for debugging.
+Logs go to `logs/tissqr-<timestamp>.log` (millisecond timestamps). With `save_html = true`, every relevant HTML response is stored in `logs/<timestamp>/` for debugging.
 
 ## Tests
 

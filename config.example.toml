@@ -15,7 +15,7 @@ name = "Gruppe 002"
 # exam only: text/regex that must appear in the exam header (e.g. the date)
 # exam_date = "12.11.2026"
 
-# Alternative to `name`: the JSF option id `tissreg check` prints (id=...).
+# Alternative to `name`: the JSF option id `tissqr check` prints (id=...).
 # More precise, but it can change when the lecturer edits the page.
 # option_id = "j_id_52:0:j_id_5d:j_id_5g:1"
 

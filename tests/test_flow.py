@@ -14,9 +14,9 @@ from urllib.parse import parse_qs
 
 import httpx
 
-from tissreg import config, pages
-from tissreg.register import Recorder, Registrar
-from tissreg.session import BASE, NotLoggedIn, TissSession, load_cookies
+from tissqr import config, pages
+from tissqr.register import Recorder, Registrar
+from tissqr.session import BASE, NotLoggedIn, TissSession, load_cookies
 
 STUB = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html><html><head><title>Loading...</title></head><body>
@@ -165,7 +165,7 @@ def make_cfg(tmp: Path, **target) -> config.Config:
 
 class FlowTest(unittest.TestCase):
     def setUp(self):
-        logging.getLogger("tissreg").setLevel(logging.CRITICAL)
+        logging.getLogger("tissqr").setLevel(logging.CRITICAL)
         self.tmp = Path(tempfile.mkdtemp())
 
     def registrar(self, mock, dry_run=None, **target):

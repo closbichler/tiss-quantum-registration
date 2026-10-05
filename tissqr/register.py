@@ -19,7 +19,7 @@ from .pages import PageError
 from .session import NotLoggedIn, Page, TissSession
 from .timing import ClockSync, measure_offset, sleep_until
 
-log = logging.getLogger("tissreg")
+log = logging.getLogger("tissqr")
 
 TRANSIENT = (httpx.HTTPError, PageError)
 

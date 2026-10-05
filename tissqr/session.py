@@ -16,7 +16,7 @@ from . import pages
 
 BASE = "https://tiss.tuwien.ac.at"
 HOST = "tiss.tuwien.ac.at"
-log = logging.getLogger("tissreg")
+log = logging.getLogger("tissqr")
 
 _STUB_RE = re.compile(r"var redirectUrl\s*=\s*'([^']*)'")
 

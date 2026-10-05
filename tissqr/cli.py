@@ -1,4 +1,4 @@
-"""Command line interface: `tissreg check|run|clock`."""
+"""Command line interface: `tissqr check|run|clock`."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ from .register import Recorder, Registrar
 from .session import NotLoggedIn, TissSession, load_cookies
 from .timing import measure_offset
 
-log = logging.getLogger("tissreg")
+log = logging.getLogger("tissqr")
 
 
 def setup_logging(log_dir: Path | None, verbose: bool) -> str:
@@ -25,7 +25,7 @@ def setup_logging(log_dir: Path | None, verbose: bool) -> str:
     log.addHandler(console)
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_dir / f"tissreg-{stamp}.log", encoding="utf-8")
+        fh = logging.FileHandler(log_dir / f"tissqr-{stamp}.log", encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         log.addHandler(fh)
@@ -84,7 +84,7 @@ def cmd_clock(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="tissreg", description="Fast headless TISS registration")
+    p = argparse.ArgumentParser(prog="tissqr", description="TISS Quantum Registration - fast headless TISS registration")
     p.add_argument("--version", action="version", version=__version__)
     p.add_argument("-v", "--verbose", action="store_true", help="debug output on the console")
     sub = p.add_subparsers(dest="cmd", required=True)

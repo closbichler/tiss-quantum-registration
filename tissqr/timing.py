@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 
-log = logging.getLogger("tissreg")
+log = logging.getLogger("tissqr")
 
 
 @dataclass
