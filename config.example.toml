@@ -1,17 +1,12 @@
-# Copy to config.toml (git-ignored) and adjust. Then: tissqr check
-
-type = "group"            # course | group | exam  (course = "LVA-Anmeldung")
-course = "185.A91"        # course number, with or without dot
+type = "group"            # course | group | exam
+course = "185.A91"
 semester = "2026W"
-name = "Gruppe 002"       # group: exact group name | exam: text (regex) in the exam's header, e.g. its date
-                          # (not needed for type = "course")
+name = "Gruppe 002"       # group: exact name | exam: part of the exam's line, e.g. its date | course: not needed
 
-# Opening time (Vienna). Leave out to use the start shown on TISS ("Beginn der Anmeldung").
-# start = 2026-10-12T10:00:00
-
-# --- only if needed ---------------------------------------------------------------------
-# study_code = "033534"   # only if you are enrolled in several curricula
-# slot = "14:15"          # exam with time slots: text of the slot (default: first offered slot)
-# cookies = "cookies.txt" # cookie file, relative to this config
-# interval_ms = 200       # time between page reloads around the opening (one request at a time)
-# window_s = 90           # give up this long after the opening
+# Optional:
+# start = 2026-10-12T10:00:00   # opening time (Vienna), default: from TISS
+# study_code = "033534"         # if you are enrolled in several curricula
+# slot = "14:15"                # exam time slot, default: the first one
+# cookies = "cookies.txt"
+# interval_ms = 200             # time between page reloads around the opening
+# window_s = 90                 # give up this long after the opening

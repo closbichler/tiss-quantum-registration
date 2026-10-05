@@ -12,7 +12,6 @@ from lxml.html import HtmlElement
 VIENNA = ZoneInfo("Europe/Vienna")
 _PARSER = lxml.html.HTMLParser(encoding="utf-8")
 
-# button labels (German / English UI)
 REGISTER = ("Anmelden", "Register", "Voranmeldung", "Voranmelden", "Preregistration")
 UNREGISTER = ("Abmelden", "Deregistration", "Unregister")
 CANCEL = ("Abbrechen", "Cancel", "Zurück", "Back")
@@ -34,15 +33,13 @@ def _has_class(cls: str) -> str:
     return f"contains(concat(' ', normalize-space(@class), ' '), ' {cls} ')"
 
 
-# --------------------------------------------------------------------------- course header
-#   <h1><span class="light">185.A62 </span>Präsentation und Moderation <small>(semester dropdown)</small></h1>
-
 def course_number(doc: HtmlElement) -> str:
     spans = doc.xpath("//*[@id='contentInner']//h1/span")
     return norm(spans[0].text_content()) if spans else ""
 
 
 def course_title(doc: HtmlElement) -> str:
+    """<h1><span>185.A62 </span>Präsentation und Moderation <small>...</small></h1>"""
     spans = doc.xpath("//*[@id='contentInner']//h1/span")
     return norm(spans[0].tail) if spans else ""
 
@@ -52,11 +49,8 @@ def sub_header(doc: HtmlElement) -> str:
     return norm(el[0].text_content()) if el else ""
 
 
-# --------------------------------------------------------------------------- options (course/groups/exams)
-# Every registration option is a <div class="groupWrapper"> with a header row
-# (name | status | seats), a details list (start/end of registration, ...) and the button.
-
 def wrappers(doc: HtmlElement) -> list[HtmlElement]:
+    """Each option (course, group, exam) is a div.groupWrapper: header row, details, button."""
     inner = doc.xpath("//*[@id='contentInner']")
     root = inner[0] if inner else doc
     return root.xpath(f".//*[{_has_class('groupWrapper')}]")
@@ -76,10 +70,7 @@ def option_header(wrapper: HtmlElement) -> str:
 
 
 def registration_start(wrapper: HtmlElement) -> datetime | None:
-    """Registration start shown on the option ("dd.mm.yyyy, HH:MM", Vienna time).
-
-    The span id ends with `:begin` (course page) or `:appBeginn` (group/exam page).
-    """
+    """'Beginn der Anmeldung'. The span id ends with :begin (course) or :appBeginn (group, exam)."""
     for span in wrapper.xpath(".//span[contains(@id, 'egin')]"):
         m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4}),?\s+(\d{1,2}):(\d{2})", span.text_content())
         if m:
@@ -96,10 +87,8 @@ def find_option(doc: HtmlElement, kind: str, name: str = "") -> HtmlElement | No
     if kind == "group":
         want = norm(name).lower()
         return next((w for w in ws if option_name(w).lower() == want), None)
-    if kind == "exam":
-        rx = re.compile(name, re.I)
-        return next((w for w in ws if rx.search(option_header(w))), None)
-    raise ValueError(f"unknown registration type {kind!r}")
+    rx = re.compile(name, re.I)
+    return next((w for w in ws if rx.search(option_header(w))), None)
 
 
 def find_button(scope: HtmlElement | None, labels=REGISTER) -> HtmlElement | None:
@@ -109,7 +98,7 @@ def find_button(scope: HtmlElement | None, labels=REGISTER) -> HtmlElement | Non
     for el in scope.iter("input", "button"):
         if el.tag == "input" and (el.get("type") or "").lower() not in ("submit", "button"):
             continue
-        # skip disabled buttons and the hidden "really deregister?" dialog button
+        # confirmOkBtn belongs to the hidden "really deregister?" dialog
         if el.get("disabled") is not None or "confirmOkBtn" in (el.get("id") or ""):
             continue
         label = el.get("value") if el.tag == "input" else (el.text_content() or el.get("value"))
@@ -117,10 +106,6 @@ def find_button(scope: HtmlElement | None, labels=REGISTER) -> HtmlElement | Non
             return el
     return None
 
-
-# --------------------------------------------------------------------------- confirm / result pages
-# Clicking "Anmelden" returns the confirmation page (form "regForm", action register.xhtml);
-# confirming it returns the result page (form "confirmForm" with a staticInfoMessage).
 
 def form_by_id(doc: HtmlElement, form_id: str) -> HtmlElement | None:
     for f in doc.forms:
@@ -134,7 +119,6 @@ def confirm_button(reg_form: HtmlElement) -> HtmlElement | None:
     btn = find_button(reg_form)
     if btn is not None:
         return btn
-    # fallback: the first submit input that is not a cancel button
     cancel = {c.lower() for c in CANCEL}
     for el in reg_form.xpath(".//input[@type='submit']"):
         if norm(el.get("value")).lower() not in cancel:
@@ -195,8 +179,6 @@ def classify_result(text: str) -> str:
     return "unknown"
 
 
-# --------------------------------------------------------------------------- form submission
-
 @dataclass
 class Submission:
     url: str
@@ -211,12 +193,8 @@ def enclosing_form(el: HtmlElement) -> HtmlElement | None:
 
 
 def build_submission(button: HtmlElement, overrides: dict[str, str] | None = None) -> Submission:
-    """Replicate a click on `button`: all successful form controls + the button itself.
-
-    This is exactly what the browser sends, e.g. for a group:
-      groupContentForm_SUBMIT=1, jakarta.faces.ViewState=..., jakarta.faces.ClientWindow=...,
-      groupContentForm:j_id_55:0:j_id_5g:j_id_5j:2:j_id_a2=Anmelden
-    """
+    """What the browser sends when `button` is clicked, e.g. groupContentForm_SUBMIT=1,
+    jakarta.faces.ViewState=..., jakarta.faces.ClientWindow=..., groupContentForm:...:j_id_a2=Anmelden"""
     form = enclosing_form(button)
     if form is None:
         raise PageError(f"button {button.get('id')} is not inside a form")
@@ -230,7 +208,7 @@ def build_submission(button: HtmlElement, overrides: dict[str, str] | None = Non
         if name in overrides:
             value = overrides.pop(name)
         data.append((name, value))
-    data.extend(overrides.items())  # e.g. a select that had no default selection
+    data.extend(overrides.items())
     name = button.get("name") or button.get("id")
     if name:
         data.append((name, button.get("value") or ""))

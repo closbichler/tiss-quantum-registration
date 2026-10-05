@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import random
 import re
 import time
@@ -19,7 +18,6 @@ HOST = "tiss.tuwien.ac.at"
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/140.0.0.0 Safari/537.36")
 TIMEOUT_S = 20.0
-log = logging.getLogger("tissqr")
 
 _STUB_RE = re.compile(r"var redirectUrl\s*=\s*'([^']*)'")
 
@@ -41,12 +39,10 @@ class Page:
 
 @dataclass
 class PostResult:
-    page: Page | None          # 200 response
-    redirect: str | None       # a redirect after POST means TISS rejected the request
+    page: Page | None
+    redirect: str | None
     elapsed_ms: float
 
-
-# --------------------------------------------------------------------------- cookies
 
 @dataclass
 class CookieSpec:
@@ -60,7 +56,7 @@ def load_cookies(path: Path) -> list[CookieSpec]:
     """Accepts a raw Cookie header, a Netscape cookies.txt or a JSON export (e.g. Cookie-Editor)."""
     text = path.read_text(encoding="utf-8").strip()
     if not text:
-        raise ValueError(f"cookie file {path} is empty")
+        raise ValueError(f"{path.name} is empty - paste your TISS cookies into it (see README)")
 
     if text.startswith("[") or text.startswith("{"):
         items = json.loads(text)
@@ -82,7 +78,6 @@ def load_cookies(path: Path) -> list[CookieSpec]:
                 out.append(CookieSpec(parts[5], parts[6], parts[0], parts[2] or "/"))
         return out
 
-    # raw header: "Cookie: a=b; c=d" (copied from a request to /education/...)
     header = " ".join(lines)
     if header.lower().startswith("cookie:"):
         header = header[7:]
@@ -95,8 +90,6 @@ def load_cookies(path: Path) -> list[CookieSpec]:
         out.append(CookieSpec(name, value, HOST, "/education" if name == "JSESSIONID" else "/"))
     return out
 
-
-# --------------------------------------------------------------------------- session
 
 def set_query(url: str, **params: str) -> str:
     s = urlsplit(url)
@@ -127,14 +120,13 @@ class TissSession:
         )
         for c in cookies:
             self.client.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-        # DeltaSpike window id (the browser generates 1000..9999 as well)
         self.window_id = str(random.randint(1000, 9999))
 
     def close(self) -> None:
         self.client.close()
 
-    # -- DeltaSpike: a GET needs ?dsrid=X&dswid=W plus cookie dsrwid-X=W, otherwise TISS
-    #    answers with the JS "Loading..." window-handler page instead of the real page.
+    # DeltaSpike: a GET needs ?dsrid=X&dswid=W plus cookie dsrwid-X=W, otherwise TISS
+    # answers with its JavaScript "Loading..." page instead of the real page.
     def _tokenize(self, url: str) -> str:
         s = urlsplit(url)
         if s.hostname != HOST or not s.path.endswith(".xhtml"):
@@ -157,13 +149,12 @@ class TissSession:
                 resp = self.client.get(self._tokenize(urljoin(url, resp.headers["location"])))
                 continue
             if urlsplit(url).hostname != HOST:
-                raise NotLoggedIn(f"redirected to login page {url.split('?')[0]}")
+                raise NotLoggedIn(f"redirected to {url.split('?')[0]}")
             if urlsplit(url).path.startswith("/admin/authentifizierung"):
-                raise NotLoggedIn("TISS asks for authentication")
+                raise NotLoggedIn("redirected to the TISS login")
             if b"handleWindowId" in resp.content[:20000] or b"handleWindowId" in resp.content[-2000:]:
                 m = _STUB_RE.search(resp.text)
                 if m:
-                    log.debug("window-handler stub received, retrying with fresh dsrid")
                     resp = self.client.get(self._tokenize(urljoin(BASE, _js_unescape(m.group(1)))))
                     continue
             return Page(url, resp.status_code, resp.content, (time.perf_counter() - t0) * 1000)

@@ -1,6 +1,7 @@
-"""Configuration file (TOML) loading."""
+"""Loads config.toml."""
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,16 +16,16 @@ KEYS = {"type", "course", "semester", "name", "start", "slot", "study_code", "co
 
 @dataclass
 class Config:
-    type: str                       # course | group | exam
-    course: str                     # "185.A91"
-    semester: str                   # "2026W"
-    name: str = ""                  # group name / exam text
-    start: datetime | None = None   # None -> start time shown on the page
-    slot: str = ""                  # exam time slot
-    study_code: str = ""            # curriculum, if enrolled in several
+    type: str
+    course: str
+    semester: str
+    name: str = ""
+    start: datetime | None = None
+    slot: str = ""
+    study_code: str = ""
     cookies: Path = Path("cookies.txt")
-    interval_ms: int = 200          # time between poll requests
-    window_s: int = 90              # keep polling this long after the opening
+    interval_ms: int = 200
+    window_s: int = 90
     log_dir: Path = Path("logs")
 
     @property
@@ -37,8 +38,7 @@ class Config:
                 f"?courseNr={self.course_nr}&semester={self.semester}")
 
     def describe(self) -> str:
-        what = "course registration" if self.type == "course" else f"{self.type} {self.name!r}"
-        return f"{self.course} {self.semester}: {what}"
+        return "the course registration" if self.type == "course" else f'{self.type} "{self.name}"'
 
 
 def _to_dt(v) -> datetime | None:
@@ -47,22 +47,32 @@ def _to_dt(v) -> datetime | None:
     if isinstance(v, str):
         v = datetime.fromisoformat(v.strip().replace(" ", "T"))
     if not isinstance(v, datetime):
-        raise ValueError(f"start must be a date and time like 2026-10-12T10:00:00, got {v!r}")
+        raise ValueError(f"start must look like 2026-10-12T10:00:00, got {v!r}")
     return v.replace(tzinfo=VIENNA) if v.tzinfo is None else v
 
 
 def load(path: str | Path) -> Config:
     path = Path(path)
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    if not path.exists():
+        raise ValueError(f"{path} not found - copy config.example.toml to {path.name} and fill it in")
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"{path.name} is not valid TOML: {e}") from None
     unknown = sorted(set(raw) - KEYS)
     if unknown:
-        raise ValueError(f"unknown setting(s) in {path.name}: {', '.join(unknown)} - see config.example.toml")
+        raise ValueError(f"{path.name}: unknown setting(s) {', '.join(unknown)} - see config.example.toml")
     kind = raw.get("type")
     if kind not in PAGES:
-        raise ValueError(f"type must be one of {', '.join(PAGES)}, got {kind!r}")
+        raise ValueError(f'{path.name}: type must be "course", "group" or "exam", got {kind!r}')
     for key in ("course", "semester") + (("name",) if kind != "course" else ()):
         if not str(raw.get(key, "")).strip():
-            raise ValueError(f"{key} is required for type = {kind!r}")
+            raise ValueError(f"{path.name}: {key} is required for type = {kind!r}")
+    if kind == "exam":
+        try:
+            re.compile(raw["name"])
+        except re.error as e:
+            raise ValueError(f"{path.name}: name is not a valid regular expression ({e})") from None
     return Config(
         type=kind,
         course=str(raw["course"]).strip(),

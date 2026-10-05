@@ -65,7 +65,7 @@ def option(name: str, status: str, begin_id: str, button: str) -> str:
   </div>
   <div class="toggleAll"><fieldset><ol>
     <li><label>Teilnehmende</label><span id="{begin_id.rsplit(':', 1)[0]}:members">12 / </span>20</li>
-    <li><label>Beginn der Anmeldung</label><span id="{begin_id}">12.10.2026, 10:00</span></li>
+    <li><label>Beginn der Anmeldung</label><span id="{begin_id}">01.09.2026, 10:00</span></li>
     {f'<li>{button}</li>' if button else ''}
   </ol></fieldset></div>
 </div>"""
@@ -80,7 +80,7 @@ def group_page(vs: str, wid: str, state: str) -> str:
     b1 = {"open": button(f"{GROUP_ID}:1:j_id_a2", "Anmelden"),
           "registered": button(f"{GROUP_ID}:1:j_id_a6", "Abmelden")}.get(state, "")
     b0 = button(f"{GROUP_ID}:0:j_id_a2", "Anmelden") if state != "closed" else ""
-    status = {"closed": "Anmeldung ab 12.10.26 10:00", "open": "Anmeldung möglich", "registered": "angemeldet"}[state]
+    status = {"closed": "Anmeldung ab 01.09.26 10:00", "open": "Anmeldung möglich", "registered": "angemeldet"}[state]
     body = (option("Gruppe 001", "Anmeldung möglich", f"{GROUP_ID}:0:appBeginn", b0)
             + option("Gruppe   002", status, f"{GROUP_ID}:1:appBeginn", b1))
     return page("groupContentForm", "/education/course/groupList.xhtml", body, vs, wid)
@@ -225,7 +225,7 @@ class FlowTest(unittest.TestCase):
 
     def test_group_registration(self):
         mock = MockTiss(open_after_polls=3)
-        self.assertEqual(self.registrar(mock).run(now=True), 0)
+        self.assertEqual(self.registrar(mock).run(), 0)
         self.assertTrue(mock.registered)
         self.assertEqual(mock.stubs_served, 0, "window handshake should avoid the loading stub")
         self.assertEqual(mock.confirm_body["regForm_SUBMIT"], "1")
@@ -237,25 +237,25 @@ class FlowTest(unittest.TestCase):
 
     def test_course_registration(self):
         mock = MockTiss(open_after_polls=1)
-        self.assertEqual(self.registrar(mock, type="course", name=None).run(now=True), 0)
+        self.assertEqual(self.registrar(mock, type="course", name=None).run(), 0)
         self.assertTrue(mock.registered)
         self.assertEqual(mock.log[-2][2], "/education/course/courseRegistration.xhtml")
 
     def test_confirm_fields(self):
         mock = MockTiss(open_after_polls=0, selects=True)
         reg = self.registrar(mock, study_code="033534", slot="14:15 - 14:30")
-        self.assertEqual(reg.run(now=True), 0)
+        self.assertEqual(reg.run(), 0)
         self.assertEqual(mock.confirm_body["regForm:studyCode"], "033534")
         self.assertEqual(mock.confirm_body["regForm:subgrouplist"], "138807")
 
     def test_rejected_click_is_retried(self):
         mock = MockTiss(open_after_polls=0, reject_clicks=2)
-        self.assertEqual(self.registrar(mock).run(now=True), 0)
+        self.assertEqual(self.registrar(mock).run(), 0)
         self.assertTrue(mock.registered)
 
     def test_dry_run_stops_before_confirm(self):
         mock = MockTiss(open_after_polls=1)
-        self.assertEqual(self.registrar(mock, dry_run=True).run(now=True), 0)
+        self.assertEqual(self.registrar(mock, dry_run=True).run(), 0)
         self.assertFalse(mock.registered)
         self.assertIsNone(mock.confirm_body)
         self.assertEqual(mock.log[-1][1:3], ("POST", "/education/course/groupList.xhtml"))
@@ -263,13 +263,13 @@ class FlowTest(unittest.TestCase):
     def test_already_registered(self):
         mock = MockTiss()
         mock.registered = True
-        self.assertEqual(self.registrar(mock).run(now=True), 0)
+        self.assertEqual(self.registrar(mock).run(), 0)
         self.assertEqual(len(mock.log), 1)
 
     def test_not_logged_in(self):
         mock = MockTiss(logged_in=False)
         with self.assertRaises(NotLoggedIn):
-            self.registrar(mock).run(now=True)
+            self.registrar(mock).run()
 
     def test_window_stub_is_resolved(self):
         """If the first GET yields the loading stub, the redirect target is fetched with a handshake."""
@@ -328,7 +328,7 @@ class ParseTest(unittest.TestCase):
         doc = self.doc(group_page("V", "1", "open"))
         w = pages.find_option(doc, "group", "gruppe 002")
         self.assertEqual(pages.option_header(w), "Gruppe 002 | Anmeldung möglich 12.10.26-20.10.26 | 12 / 20")
-        self.assertEqual(pages.registration_start(w), datetime(2026, 10, 12, 10, 0, tzinfo=VIENNA))
+        self.assertEqual(pages.registration_start(w), datetime(2026, 9, 1, 10, 0, tzinfo=VIENNA))
         self.assertIsNone(pages.find_option(doc, "group", "Gruppe 00"))
 
     def test_find_exam_by_header_regex(self):
@@ -391,12 +391,23 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual((cfg.interval_ms, cfg.window_s), (200, 90))
 
     def test_errors(self):
+        with self.assertRaisesRegex(ValueError, "not found"):
+            config.load(Path(tempfile.mkdtemp()) / "config.toml")
+        with self.assertRaisesRegex(ValueError, "not valid TOML"):
+            self.load('type = group\n')
         with self.assertRaisesRegex(ValueError, "unknown setting"):
             self.load('[target]\ntype = "group"\n')
         with self.assertRaisesRegex(ValueError, "name is required"):
             self.load('type = "group"\ncourse = "185.A91"\nsemester = "2026W"\n')
         with self.assertRaisesRegex(ValueError, "type must be"):
             self.load('type = "lva"\ncourse = "185.A91"\nsemester = "2026W"\n')
+        with self.assertRaisesRegex(ValueError, "regular expression"):
+            self.load('type = "exam"\ncourse = "185.A91"\nsemester = "2026W"\nname = "VO ("\n')
+
+    def test_durations(self):
+        self.assertEqual(register.fmt_duration(65), "1m 05s")
+        self.assertEqual(register.fmt_duration(3 * 3600 + 5), "3h 00m 05s")
+        self.assertEqual(register.fmt_duration(2 * 86400 + 3600 + 120), "2d 1h 02m")
 
 
 if __name__ == "__main__":
