@@ -1,0 +1,15 @@
+# secrets / personal
+config.toml
+cookies*.txt
+cookies*.json
+*.cookies
+
+# runtime output
+logs/
+
+# python
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/

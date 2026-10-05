@@ -1,0 +1,58 @@
+# Copy to config.toml (git-ignored) and adjust.
+
+[target]
+# lva   = course registration ("LVA-Anmeldung")
+# group = group registration ("Gruppen")
+# exam  = exam registration ("Prüfungen")
+type = "group"
+course = "185.A91"          # LVA number, with or without dot
+semester = "2026W"
+
+# group: exact group name as shown on TISS (whitespace-insensitive, case-insensitive)
+# exam:  regular expression matched against the exam name
+name = "Gruppe 002"
+
+# exam only: text/regex that must appear in the exam header (e.g. the date)
+# exam_date = "12.11.2026"
+
+# Alternative to `name`: the JSF option id `tissreg check` prints (id=...).
+# More precise, but it can change when the lecturer edits the page.
+# option_id = "j_id_52:0:j_id_5d:j_id_5g:1"
+
+# exam with time slots: start/end time of the slot, e.g. "14:15 - 14:30"
+# (empty = first available slot)
+# slot = ""
+
+# only if you are enrolled in several curricula, e.g. "033534"
+# study_code = ""
+
+[schedule]
+# Registration opening (Vienna time). Omit to use the start time shown on the page.
+# start = 2026-10-12T10:00:00
+timezone = "Europe/Vienna"
+
+lead_ms = 1500           # start polling this long before the opening
+interval_ms = 200        # spacing between poll requests (requests are sequential, never parallel)
+window_s = 90            # give up this long after the opening
+arrive_margin_ms = 40    # one poll is timed to arrive at the server this long after the opening
+keepalive_s = 600        # reload the page this often while waiting, to keep the session alive
+use_server_clock = true  # sync to the TISS server clock via the HTTP Date header
+
+[auth]
+# Cookie file: raw "Cookie:" header, Netscape cookies.txt, or JSON export. See README.
+cookies_file = "cookies.txt"
+
+[register]
+max_attempts = 5         # register/confirm attempts once the button is visible
+
+[log]
+dir = "logs"
+save_html = true         # store every relevant HTML response for debugging
+
+# [labels]               # only needed if TISS renames its buttons
+# register = ["Anmelden", "Register", "Voranmeldung", "Voranmelden", "Preregistration"]
+# unregister = ["Abmelden", "Deregistration"]
+
+# [http]
+# user_agent = "..."
+# timeout_s = 20
