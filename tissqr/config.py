@@ -2,29 +2,30 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
+from .pages import VIENNA
 from .session import BASE
 
-PAGES = {"lva": "courseRegistration", "group": "groupList", "exam": "examDateList"}
-
-DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/140.0.0.0 Safari/537.36")
+PAGES = {"course": "courseRegistration", "group": "groupList", "exam": "examDateList"}
+KEYS = {"type", "course", "semester", "name", "start", "slot", "study_code", "cookies", "interval_ms", "window_s"}
 
 
 @dataclass
-class Target:
-    type: str
-    course: str
-    semester: str
-    name: str = ""
-    exam_date: str = ""
-    option_id: str = ""
-    slot: str = ""
-    study_code: str = ""
+class Config:
+    type: str                       # course | group | exam
+    course: str                     # "185.A91"
+    semester: str                   # "2026W"
+    name: str = ""                  # group name / exam text
+    start: datetime | None = None   # None -> start time shown on the page
+    slot: str = ""                  # exam time slot
+    study_code: str = ""            # curriculum, if enrolled in several
+    cookies: Path = Path("cookies.txt")
+    interval_ms: int = 200          # time between poll requests
+    window_s: int = 90              # keep polling this long after the opening
+    log_dir: Path = Path("logs")
 
     @property
     def course_nr(self) -> str:
@@ -36,98 +37,42 @@ class Target:
                 f"?courseNr={self.course_nr}&semester={self.semester}")
 
     def describe(self) -> str:
-        what = {"lva": "LVA registration", "group": f"group {self.name!r}",
-                "exam": f"exam {self.name!r} {self.exam_date}".strip()}[self.type]
+        what = "course registration" if self.type == "course" else f"{self.type} {self.name!r}"
         return f"{self.course} {self.semester}: {what}"
 
 
-@dataclass
-class Schedule:
-    start: datetime | None = None   # None -> auto-detect from the page
-    lead_ms: int = 1500             # start polling this long before the opening
-    interval_ms: int = 200          # time between poll request starts
-    window_s: int = 90              # keep polling this long after the opening
-    arrive_margin_ms: int = 40      # aim for a poll to *arrive* this long after the opening
-    keepalive_s: int = 600          # refresh the page this often while waiting
-    use_server_clock: bool = True
-
-
-@dataclass
-class Labels:
-    register: list[str] = field(default_factory=lambda: [
-        "Anmelden", "Register", "Voranmeldung", "Voranmelden", "Preregistration"])
-    unregister: list[str] = field(default_factory=lambda: ["Abmelden", "Deregistration"])
-
-
-@dataclass
-class Config:
-    target: Target
-    schedule: Schedule
-    cookies_file: Path
-    labels: Labels
-    log_dir: Path
-    save_html: bool = True
-    user_agent: str = DEFAULT_UA
-    timeout_s: float = 20.0
-    max_attempts: int = 5
-
-
-def _to_dt(v, tz: ZoneInfo) -> datetime | None:
+def _to_dt(v) -> datetime | None:
     if v in (None, ""):
         return None
     if isinstance(v, str):
         v = datetime.fromisoformat(v.strip().replace(" ", "T"))
     if not isinstance(v, datetime):
-        raise ValueError(f"schedule.start must be a date-time, got {v!r}")
-    return v.replace(tzinfo=tz) if v.tzinfo is None else v
+        raise ValueError(f"start must be a date and time like 2026-10-12T10:00:00, got {v!r}")
+    return v.replace(tzinfo=VIENNA) if v.tzinfo is None else v
 
 
 def load(path: str | Path) -> Config:
     path = Path(path)
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    base = path.parent
-
-    t = raw.get("target", {})
-    kind = t.get("type", "group")
+    unknown = sorted(set(raw) - KEYS)
+    if unknown:
+        raise ValueError(f"unknown setting(s) in {path.name}: {', '.join(unknown)} - see config.example.toml")
+    kind = raw.get("type")
     if kind not in PAGES:
-        raise ValueError(f"target.type must be one of {sorted(PAGES)}, got {kind!r}")
-    target = Target(
-        type=kind,
-        course=str(t["course"]),
-        semester=str(t["semester"]).upper(),
-        name=t.get("name", ""),
-        exam_date=t.get("exam_date", ""),
-        option_id=t.get("option_id", ""),
-        slot=t.get("slot", ""),
-        study_code=str(t.get("study_code", "")),
-    )
-    if kind in ("group", "exam") and not (target.name or target.option_id):
-        raise ValueError("target.name (or target.option_id) is required for group/exam")
-
-    s = raw.get("schedule", {})
-    tz = ZoneInfo(s.get("timezone", "Europe/Vienna"))
-    sched = Schedule(start=_to_dt(s.get("start"), tz))
-    for k in ("lead_ms", "interval_ms", "window_s", "arrive_margin_ms", "keepalive_s", "use_server_clock"):
-        if k in s:
-            setattr(sched, k, type(getattr(sched, k))(s[k]))
-
-    lab = raw.get("labels", {})
-    labels = Labels()
-    for k in ("register", "unregister"):
-        if k in lab:
-            setattr(labels, k, list(lab[k]))
-
-    a = raw.get("auth", {})
-    lg = raw.get("log", {})
-    http = raw.get("http", {})
+        raise ValueError(f"type must be one of {', '.join(PAGES)}, got {kind!r}")
+    for key in ("course", "semester") + (("name",) if kind != "course" else ()):
+        if not str(raw.get(key, "")).strip():
+            raise ValueError(f"{key} is required for type = {kind!r}")
     return Config(
-        target=target,
-        schedule=sched,
-        cookies_file=(base / a.get("cookies_file", "cookies.txt")).resolve(),
-        labels=labels,
-        log_dir=(base / lg.get("dir", "logs")).resolve(),
-        save_html=bool(lg.get("save_html", True)),
-        user_agent=http.get("user_agent", DEFAULT_UA),
-        timeout_s=float(http.get("timeout_s", 20.0)),
-        max_attempts=int(raw.get("register", {}).get("max_attempts", 5)),
+        type=kind,
+        course=str(raw["course"]).strip(),
+        semester=str(raw["semester"]).strip().upper(),
+        name=str(raw.get("name", "")).strip(),
+        start=_to_dt(raw.get("start")),
+        slot=str(raw.get("slot", "")).strip(),
+        study_code=str(raw.get("study_code", "")).strip(),
+        cookies=(path.parent / raw.get("cookies", "cookies.txt")).resolve(),
+        interval_ms=int(raw.get("interval_ms", 200)),
+        window_s=int(raw.get("window_s", 90)),
+        log_dir=(path.parent / "logs").resolve(),
     )

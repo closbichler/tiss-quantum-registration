@@ -16,6 +16,9 @@ from . import pages
 
 BASE = "https://tiss.tuwien.ac.at"
 HOST = "tiss.tuwien.ac.at"
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/140.0.0.0 Safari/537.36")
+TIMEOUT_S = 20.0
 log = logging.getLogger("tissqr")
 
 _STUB_RE = re.compile(r"var redirectUrl\s*=\s*'([^']*)'")
@@ -54,7 +57,7 @@ class CookieSpec:
 
 
 def load_cookies(path: Path) -> list[CookieSpec]:
-    """Accepts a Netscape cookies.txt, a JSON export (e.g. Cookie-Editor) or a raw Cookie header."""
+    """Accepts a raw Cookie header, a Netscape cookies.txt or a JSON export (e.g. Cookie-Editor)."""
     text = path.read_text(encoding="utf-8").strip()
     if not text:
         raise ValueError(f"cookie file {path} is empty")
@@ -108,18 +111,16 @@ def _js_unescape(s: str) -> str:
 
 
 class TissSession:
-    MAX_HOPS = 12
+    MAX_HOPS = 8
 
-    def __init__(self, cookies: list[CookieSpec], user_agent: str, timeout_s: float = 20.0,
-                 transport: httpx.BaseTransport | None = None):
+    def __init__(self, cookies: list[CookieSpec], transport: httpx.BaseTransport | None = None):
         self.client = httpx.Client(
             transport=transport,
             follow_redirects=False,
-            timeout=httpx.Timeout(timeout_s, connect=10.0),
-            # TISS' Apache keeps idle connections for 200s, so a warmed-up TLS connection is reused
-            limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=150),
+            timeout=httpx.Timeout(TIMEOUT_S, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=2, keepalive_expiry=120),
             headers={
-                "User-Agent": user_agent,
+                "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "de-AT,de;q=0.9,en;q=0.6",
             },
@@ -147,24 +148,16 @@ class TissSession:
         return set_query(url, dsrid=rid, dswid=self.window_id)
 
     def get(self, url: str) -> Page:
+        """GET a TISS page, following redirects and window-handler stubs (normally: one round trip)."""
         t0 = time.perf_counter()
         resp = self.client.get(self._tokenize(url))
-        return self._settle(resp, t0)
-
-    def _settle(self, resp: httpx.Response, t0: float) -> Page:
-        """Follow redirects / window-handler stubs / SAML hops until we have a real TISS page."""
         for _ in range(self.MAX_HOPS):
             url = str(resp.url)
-            host = urlsplit(url).hostname or ""
             if resp.is_redirect:
                 resp = self.client.get(self._tokenize(urljoin(url, resp.headers["location"])))
                 continue
-            if host != HOST:
-                nxt = self._saml_continue(resp)
-                if nxt is None:
-                    raise NotLoggedIn(f"redirected to login page {url.split('?')[0]}")
-                resp = nxt
-                continue
+            if urlsplit(url).hostname != HOST:
+                raise NotLoggedIn(f"redirected to login page {url.split('?')[0]}")
             if urlsplit(url).path.startswith("/admin/authentifizierung"):
                 raise NotLoggedIn("TISS asks for authentication")
             if b"handleWindowId" in resp.content[:20000] or b"handleWindowId" in resp.content[-2000:]:
@@ -176,19 +169,6 @@ class TissSession:
             return Page(url, resp.status_code, resp.content, (time.perf_counter() - t0) * 1000)
         raise pages.PageError("too many redirects")
 
-    def _saml_continue(self, resp: httpx.Response) -> httpx.Response | None:
-        """If the IdP still has a valid session (idp cookies supplied), auto-submit the SAML form."""
-        if b"SAMLResponse" not in resp.content:
-            return None
-        doc = pages.parse(resp.content, str(resp.url))
-        for form in doc.forms:
-            values = form.form_values()
-            if any(n == "SAMLResponse" for n, _ in values):
-                log.info("IdP session still valid - completing SAML login automatically")
-                return self.client.post(form.action, content=urlencode(values),
-                                        headers={"Content-Type": "application/x-www-form-urlencoded"})
-        return None
-
     def post(self, sub: pages.Submission) -> PostResult:
         """POST a form. TISS answers 200 on success; any redirect means the request was rejected."""
         t0 = time.perf_counter()
@@ -198,8 +178,6 @@ class TissSession:
         ms = (time.perf_counter() - t0) * 1000
         if resp.is_redirect:
             return PostResult(None, urljoin(str(resp.url), resp.headers.get("location", "")), ms)
-        if urlsplit(str(resp.url)).hostname != HOST:
-            raise NotLoggedIn("POST answered from outside TISS")
         return PostResult(Page(str(resp.url), resp.status_code, resp.content, ms), None, ms)
 
     def head_root(self) -> tuple[httpx.Response, float, float]:

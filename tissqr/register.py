@@ -1,4 +1,4 @@
-"""The registration flow: warm up, wait, poll around the opening, click + confirm."""
+"""The registration flow: wait for the opening, poll the page, click "Anmelden", confirm."""
 from __future__ import annotations
 
 import enum
@@ -15,7 +15,7 @@ from lxml.html import HtmlElement
 
 from . import pages
 from .config import Config
-from .pages import PageError
+from .pages import VIENNA, PageError
 from .session import NotLoggedIn, Page, TissSession
 from .timing import ClockSync, measure_offset, sleep_until
 
@@ -23,17 +23,22 @@ log = logging.getLogger("tissqr")
 
 TRANSIENT = (httpx.HTTPError, PageError)
 
+LEAD_S = 1.5             # start polling this long before the opening
+ARRIVE_MARGIN_S = 0.04   # one poll is timed to arrive at the server this long after the opening
+KEEPALIVE_S = 300        # while waiting, reload the page this often (keeps the session alive)
+RESYNC_S = 30            # re-measure the server clock this long before the opening
+MAX_ATTEMPTS = 5         # register attempts once the button is visible
+
 
 class Outcome(enum.Enum):
     REGISTERED = "registered"
     WAITLIST = "waitlist"
     DRY_RUN = "dry-run"
-    REJECTED = "rejected"   # TISS answered with a redirect (stale ViewState, closed, full, ...)
-    UNKNOWN = "unknown"
+    FAILED = "failed"    # rejected (redirect), no confirmation page, or no success message
 
 
 class Recorder:
-    """Saves raw HTML responses for post-mortem debugging."""
+    """Saves raw HTML responses (logs/<run>/NNN-label.html) for post-mortem debugging."""
 
     def __init__(self, directory: Path | None):
         self.dir = directory
@@ -58,271 +63,160 @@ class Status:
     start: datetime | None
 
 
+def clock(ts: float) -> str:
+    return datetime.fromtimestamp(ts, VIENNA).strftime("%H:%M:%S.%f")[:-3]
+
+
+def fmt_start(dt: datetime | None) -> str:
+    return dt.astimezone(VIENNA).strftime("%d.%m.%Y %H:%M") if dt else "unknown"
+
+
+def fmt_duration(s: float) -> str:
+    h, m = divmod(int(s) // 60, 60)
+    return f"{h}h {m:02d}m {int(s) % 60:02d}s"
+
+
 class Registrar:
-    def __init__(self, cfg: Config, sess: TissSession, rec: Recorder, dry_run: str | None = None):
+    def __init__(self, cfg: Config, sess: TissSession, rec: Recorder, dry_run: bool = False):
         self.cfg = cfg
-        self.t = cfg.target
         self.sess = sess
         self.rec = rec
-        self.dry_run = dry_run          # None | "detect" | "confirm"
+        self.dry_run = dry_run
         self.sync = ClockSync(0.0, 0.0, 0.1)
 
-    # ------------------------------------------------------------------ helpers
+    # ------------------------------------------------------------------ page state
 
-    def inspect(self, save_as: str | None = None) -> Status:
-        page = self.sess.get(self.t.url)
-        if save_as:
-            self.rec.save(save_as, page)
+    def inspect(self) -> Status:
+        page = self.sess.get(self.cfg.url)
         if page.status >= 400:
             raise PageError(f"HTTP {page.status} for {page.url}")
         doc = page.doc()
-        opt = pages.find_option(doc, self.t.type, self.t.name, self.t.exam_date, self.t.option_id)
-        btn = pages.find_button(opt, self.cfg.labels.register)
-        registered = pages.find_button(opt, self.cfg.labels.unregister) is not None
-        start = pages.registration_start(opt) if opt is not None else None
-        return Status(page, doc, opt, btn, registered, start)
-
-    def _safe_inspect(self, label: str) -> Status | None:
-        try:
-            st = self.inspect(save_as=label if label != "keepalive" else None)
-            log.info("%s ok (%.0f ms)%s", label, st.page.elapsed_ms,
-                     " - button already visible!" if st.button is not None else "")
-            return st
-        except NotLoggedIn:
-            raise
-        except TRANSIENT as e:
-            log.warning("%s failed: %s", label, e)
-            return None
-
-    def clock_sync(self) -> None:
-        if not self.cfg.schedule.use_server_clock:
-            return
-        s = measure_offset(self.sess.head_root)
-        if s is None:
-            log.warning("could not determine server clock offset - using local clock")
-            return
-        if abs(s.offset) > 120:
-            log.warning("server clock differs by %.1fs from local clock - check NTP! Using server clock.",
-                        s.offset)
-        log.info("server clock offset %+.3fs (+-%.3fs), best RTT %.0f ms", s.offset, s.error, s.rtt * 1000)
-        self.sync = s
-
-    def server_now(self) -> float:
-        return time.time() + self.sync.offset
-
-    def _fmt(self, ts: float) -> str:
-        return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+        opt = pages.find_option(doc, self.cfg.type, self.cfg.name)
+        return Status(page, doc, opt,
+                      button=pages.find_button(opt),
+                      registered=pages.find_button(opt, pages.UNREGISTER) is not None,
+                      start=pages.registration_start(opt) if opt is not None else None)
 
     def report(self, st: Status, list_all: bool = False) -> bool:
         """Log what we see on the page. Returns False if something is clearly wrong."""
         ok = True
-        nr = pages.course_number(st.doc)
-        sub = pages.sub_header(st.doc)
+        nr, sub = pages.course_number(st.doc), pages.sub_header(st.doc)
         log.info("page: %s %s | %s", nr, pages.course_title(st.doc), sub)
-        if re.sub(r"\W", "", nr).upper() != self.t.course_nr:
-            log.warning("course number on page (%s) != configured (%s)", nr, self.t.course)
+        if re.sub(r"\W", "", nr).upper() != self.cfg.course_nr:
+            log.warning("course number on page (%s) != configured (%s)", nr, self.cfg.course)
             ok = False
-        if self.t.semester not in sub:
-            log.warning("semester %s not found in page header %r", self.t.semester, sub)
+        if self.cfg.semester not in sub:
+            log.warning("semester %s not found in page header %r", self.cfg.semester, sub)
             ok = False
-        opts = pages.wrappers(st.doc)
         if list_all or st.option is None:
+            opts = pages.wrappers(st.doc)
             log.info("options on page (%d):", len(opts))
             for w in opts:
-                btn = pages.find_button(w, self.cfg.labels.register + self.cfg.labels.unregister)
-                start = pages.registration_start(w)
-                log.info("  - %-40s id=%s start=%s button=%s", pages.option_header(w)[:80],
-                         pages.option_id(w) or "-", start.strftime("%d.%m.%Y %H:%M") if start else "-",
-                         btn.get("value") if btn is not None else "-")
+                btn = pages.find_button(w, pages.REGISTER + pages.UNREGISTER)
+                log.info("  - %-60s start %s, button %s", pages.option_header(w)[:60],
+                         fmt_start(pages.registration_start(w)), btn.get("value") if btn is not None else "-")
         if st.option is None:
-            log.warning("target option NOT found on page (%s)", self.t.describe())
+            log.warning("target NOT found on page (%s)", self.cfg.describe())
             ok = False
         else:
-            log.info("target: %s | id=%s | start=%s | register button: %s | registered: %s",
-                     pages.option_header(st.option)[:100], pages.option_id(st.option) or "-",
-                     st.start.isoformat() if st.start else "unknown",
-                     "VISIBLE" if st.button is not None else "not yet", st.registered)
+            log.info("target: %s | start %s | register button %s%s", pages.option_header(st.option),
+                     fmt_start(st.start), "VISIBLE" if st.button is not None else "not visible (yet)",
+                     " | ALREADY REGISTERED" if st.registered else "")
         for m in pages.messages(st.doc):
             log.info("TISS message: %s", m)
         return ok
 
-    # ------------------------------------------------------------------ registration steps
+    # ------------------------------------------------------------------ clock
 
-    def _confirm_overrides(self, reg_form: HtmlElement) -> dict[str, str]:
-        ov: dict[str, str] = {}
-        sc = pages.select_options(reg_form, "studyCode")
-        if sc:
-            name, opts = sc
-            if self.t.study_code:
-                if any(v == self.t.study_code for v, _ in opts):
-                    ov[name] = self.t.study_code
-                else:
-                    log.warning("study code %s not offered, options: %s", self.t.study_code, opts)
-            elif len(opts) > 1:
-                log.warning("several study codes offered, keeping TISS default: %s", opts)
-        elif self.t.study_code:
-            ov["regForm:studyCode"] = self.t.study_code
+    def clock_sync(self) -> None:
+        s = measure_offset(self.sess.head_root)
+        if s is None:
+            log.warning("could not determine the server clock offset - keeping %+.3fs", self.sync.offset)
+            return
+        if abs(s.offset) > 120:
+            log.warning("server clock differs by %.1fs from the local clock - check NTP!", s.offset)
+        log.info("server clock offset %+.3fs (+-%.3fs), best RTT %.0f ms", s.offset, s.error, s.rtt * 1000)
+        self.sync = s
 
-        sl = pages.select_options(reg_form, "subgrouplist")
-        if sl:
-            name, opts = sl
-            choice = None
-            if self.t.slot:
-                tokens = [x for x in re.split(r"[\s,\-–]+", self.t.slot) if x]
-                choice = next((v for v, txt in opts if all(tok in txt for tok in tokens)), None)
-                if choice is None:
-                    log.warning("slot %r not found, available: %s", self.t.slot, [t for _, t in opts])
-            if choice is None and opts:
-                choice = opts[0][0]
-                log.warning("using first available slot: %s", opts[0][1])
-            if choice is not None:
-                ov[name] = choice
-        return ov
-
-    def _evaluate(self, page: Page) -> Outcome:
-        doc = page.doc()
-        msg = pages.result_message(doc)
-        kind = pages.classify_result(msg) if msg else "unknown"
-        if msg:
-            log.info("TISS result: %s", msg)
-        else:
-            for m in pages.messages(doc):
-                log.info("TISS message: %s", m)
-        if kind in ("success", "prereg", "already"):
-            if kind == "prereg":
-                log.info("pre-registration recorded (needs confirmation by the lecturer)")
-            return Outcome.REGISTERED
-        if kind == "waitlist":
-            return Outcome.WAITLIST
-        return Outcome.UNKNOWN
-
-    def attempt(self, st: Status) -> Outcome:
-        assert st.button is not None
-        if self.dry_run == "detect":
-            log.info("DRY RUN: register button %r (%s) is clickable - not clicking",
-                     st.button.get("value"), st.button.get("name"))
-            return Outcome.DRY_RUN
-
-        t0 = time.perf_counter()
-        sub = pages.build_submission(st.button)
-        res = self.sess.post(sub)
-        log.info("register click -> %s in %.0f ms",
-                 "redirect " + res.redirect if res.redirect else f"HTTP {res.page.status}", res.elapsed_ms)
-        if res.redirect:
-            return Outcome.REJECTED
-        self.rec.save("register-response", res.page)
-        doc = res.page.doc()
-
-        reg_form = pages.form_by_id(doc, "regForm")
-        if reg_form is None:
-            # no confirmation page: maybe the result is shown directly
-            return self._evaluate(res.page)
-        btn = pages.confirm_button(reg_form, self.cfg.labels.register)
-        if btn is None:
-            log.error("confirmation page has no confirm button")
-            return Outcome.UNKNOWN
-        ov = self._confirm_overrides(reg_form)
-        if self.dry_run == "confirm":
-            log.info("DRY RUN: confirmation page reached (button %r, extra fields %s) - NOT confirming",
-                     btn.get("value"), ov)
-            return Outcome.DRY_RUN
-
-        sub = pages.build_submission(btn, ov)
-        res = self.sess.post(sub)
-        log.info("confirm -> %s in %.0f ms (total %.0f ms)",
-                 "redirect " + res.redirect if res.redirect else f"HTTP {res.page.status}",
-                 res.elapsed_ms, (time.perf_counter() - t0) * 1000)
-        if res.redirect:
-            return Outcome.REJECTED
-        self.rec.save("confirm-response", res.page)
-        return self._evaluate(res.page)
+    def _local(self, start: datetime) -> float:
+        """Local epoch time at which the server clock reaches `start`."""
+        return start.timestamp() - self.sync.offset
 
     # ------------------------------------------------------------------ main flow
 
     def run(self, now: bool = False) -> int:
-        log.info("target: %s", self.t.describe())
-        log.info("url: %s", self.t.url)
-        st = self.inspect(save_as="warmup")
+        log.info("target: %s", self.cfg.describe())
+        log.info("url: %s", self.cfg.url)
+        st = self.inspect()
+        self.rec.save("start", st.page)
         self.report(st)
         if st.registered:
             log.info("already registered - nothing to do")
             return 0
+        if now:
+            return self._poll(None)
 
-        start = None if now else (self.cfg.schedule.start or st.start)
-        if not now and start is None:
-            log.error("no start time configured and none found on the page; set schedule.start or use --now")
+        start = self.cfg.start or st.start
+        if start is None:
+            log.error("no start time configured and none found on the page; set `start` or use --now")
             return 2
-        if self.cfg.schedule.start and st.start and self.cfg.schedule.start != st.start:
-            log.warning("configured start %s differs from start shown on page %s",
-                        self.cfg.schedule.start.isoformat(), st.start.isoformat())
-
-        self.clock_sync()
-        if start is not None:
-            log.info("registration opens at %s (server time)", start.isoformat())
-            if start.timestamp() + self.cfg.schedule.window_s < self.server_now():
-                log.warning("start time is already past the polling window - starting now")
-                start = None
-            else:
-                self._wait(start)
-        return self._burst(start)
-
-    def _open_local(self, start: datetime) -> float:
-        return start.timestamp() - self.sync.offset
+        if self.cfg.start and st.start and self.cfg.start != st.start:
+            log.warning("configured start %s differs from the start shown on the page (%s)",
+                        fmt_start(self.cfg.start), fmt_start(st.start))
+        if start.timestamp() <= time.time():
+            log.info("registration is open since %s - polling now", fmt_start(start))
+            return self._poll(None)
+        if start.timestamp() - time.time() > 10:   # the sync takes ~4 s
+            self.clock_sync()
+        log.info("registration opens at %s (server time), in %s", fmt_start(start),
+                 fmt_duration(max(0.0, self._local(start) - time.time())))
+        self._wait(start)
+        return self._poll(start)
 
     def _wait(self, start: datetime) -> None:
-        sch = self.cfg.schedule
-        next_ka = time.time() + sch.keepalive_s
-        did_sync = self._open_local(start) - time.time() <= 90
-        did_warm = False
-        while True:
-            rem = self._open_local(start) - time.time()
-            if rem <= sch.lead_ms / 1000 + 2.0:
-                return
-            if not did_sync and rem <= 90:
-                self.clock_sync()
-                did_sync = True
-                continue
-            if not did_warm and rem <= 12:
-                self._safe_inspect("prewarm")   # fresh session + warm TLS connection
-                did_warm = True
-                continue
-            if time.time() >= next_ka and rem > 30:
-                h, m = divmod(int(rem) // 60, 60)
-                log.info("waiting: %dh %02dm %02ds until opening", h, m, int(rem) % 60)
-                self._safe_inspect("keepalive")
-                next_ka = time.time() + sch.keepalive_s
-                continue
-            checkpoints = [rem - sch.lead_ms / 1000 - 2.0, next_ka - time.time()]
-            if not did_sync:
-                checkpoints.append(rem - 90)
-            if not did_warm:
-                checkpoints.append(rem - 12)
-            upcoming = [c for c in checkpoints if c > 0]
-            time.sleep(min(60.0, max(0.05, min(upcoming) if upcoming else 0.05)))
+        """Sleep until the polling starts. Reloads the page every few minutes to keep the session
+        alive and re-measures the server clock shortly before the opening."""
+        if self._local(start) - time.time() < 1.5 * RESYNC_S:
+            return   # the clock sync in run() is recent enough
+        while self._local(start) - time.time() > RESYNC_S + KEEPALIVE_S:
+            time.sleep(KEEPALIVE_S)
+            self._keepalive(start)
+        sleep_until(self._local(start) - RESYNC_S)
+        self.clock_sync()
 
-    def _burst(self, start: datetime | None) -> int:
-        sch = self.cfg.schedule
-        interval = sch.interval_ms / 1000
-        if start is not None:
-            open_l = self._open_local(start)
-            # send one poll so that it *arrives* at the server just after the opening
-            anchor = open_l + sch.arrive_margin_ms / 1000 - self.sync.rtt / 2
-            next_send = anchor - math.ceil(sch.lead_ms / sch.interval_ms) * interval
-            deadline = open_l + sch.window_s
-        else:
+    def _keepalive(self, start: datetime) -> None:
+        try:
+            st = self.inspect()
+        except NotLoggedIn:
+            raise
+        except TRANSIENT as e:
+            log.warning("page reload failed: %s", e)
+            return
+        log.info("%s until the opening - session ok (%.0f ms)%s",
+                 fmt_duration(self._local(start) - time.time()), st.page.elapsed_ms,
+                 " - register button is already visible" if st.button is not None else "")
+
+    def _poll(self, start: datetime | None) -> int:
+        """Reload the page every interval_ms (one request at a time) until the register button
+        shows up, then register. With a start time, one poll is timed to arrive right after it."""
+        interval = self.cfg.interval_ms / 1000
+        if start is None:
             anchor = None
             next_send = time.time()
-            deadline = time.time() + sch.window_s
-        log.info("polling every %d ms until %s", sch.interval_ms, self._fmt(deadline))
+            deadline = next_send + self.cfg.window_s
+        else:
+            open_at = self._local(start)
+            anchor = open_at + ARRIVE_MARGIN_S - self.sync.rtt / 2
+            next_send = anchor - math.ceil(LEAD_S / interval) * interval
+            deadline = open_at + self.cfg.window_s
+        log.info("polling every %d ms until %s", self.cfg.interval_ms, clock(deadline))
 
         polls = attempts = 0
-        last_elapsed = 0.15
+        rtt = self.sync.rtt
         st: Status | None = None
         while time.time() < deadline:
-            now = time.time()
-            if anchor is not None and now < anchor and next_send < anchor \
-                    and next_send + last_elapsed > anchor - 0.01:
-                next_send = anchor   # keep the slot right at the opening free
+            if anchor is not None and next_send < anchor < next_send + rtt + 0.01:
+                next_send = anchor   # that poll would still be running at the opening: wait for the opening one
             sleep_until(next_send)
             polls += 1
             sent = time.time()
@@ -334,55 +228,130 @@ class Registrar:
                 log.warning("poll %d failed after %.0f ms: %s", polls, (time.time() - sent) * 1000, e)
                 next_send = max(sent + interval, time.time())
                 continue
-            last_elapsed = st.page.elapsed_ms / 1000
-            log.debug("poll %d sent %s (server %s) %.0f ms option=%s button=%s", polls, self._fmt(sent),
-                      self._fmt(sent + self.sync.offset), st.page.elapsed_ms,
-                      st.option is not None, st.button is not None)
+            rtt = st.page.elapsed_ms / 1000
+            log.debug("poll %d sent %s (server %s), %.0f ms, button=%s", polls, clock(sent),
+                      clock(sent + self.sync.offset), st.page.elapsed_ms, st.button is not None)
 
             if st.registered:
-                log.info("SUCCESS: page shows you are registered")
+                log.info("SUCCESS: the page shows you are registered")
                 return 0
             if st.button is None:
                 if polls == 1 or polls % 25 == 0:
                     log.info("poll %d: %s (%.0f ms)", polls,
-                             "option not found" if st.option is None else "no register button yet",
+                             "target not found" if st.option is None else "no register button yet",
                              st.page.elapsed_ms)
                 next_send = max(next_send + interval, time.time())
                 continue
 
             attempts += 1
             log.info("register button visible (poll %d, sent at server time %s) - attempt %d",
-                     polls, self._fmt(sent + self.sync.offset), attempts)
-            self.rec.save("open-page", st.page)
+                     polls, clock(sent + self.sync.offset), attempts)
             try:
-                out = self.attempt(st)
+                out = self._attempt(st)
             except NotLoggedIn:
                 raise
             except TRANSIENT as e:
                 log.warning("attempt %d failed: %s", attempts, e)
-                out = Outcome.UNKNOWN
-            log.info("attempt %d outcome: %s", attempts, out.value)
-            if out is Outcome.DRY_RUN:
-                return 0
-            if out is Outcome.REGISTERED:
-                self._verify()
+                out = Outcome.FAILED
+            log.info("attempt %d: %s", attempts, out.value)
+            if out in (Outcome.REGISTERED, Outcome.DRY_RUN):
                 return 0
             if out is Outcome.WAITLIST:
                 log.warning("ended up on the WAITING LIST")
                 return 3
-            if attempts >= self.cfg.max_attempts:
+            if attempts >= MAX_ATTEMPTS:
                 log.error("giving up after %d attempts", attempts)
                 break
-            next_send = time.time()   # retry immediately with a fresh page/ViewState
+            next_send = time.time()   # retry right away with a fresh page (new ViewState)
 
         if st is not None:
             self.rec.save("last-poll", st.page)
         log.error("FAILED: not registered (polls=%d, attempts=%d)", polls, attempts)
         return 1
 
-    def _verify(self) -> None:
+    # ------------------------------------------------------------------ register + confirm
+
+    def _attempt(self, st: Status) -> Outcome:
+        """Click the register button, then confirm. HTML is saved afterwards, off the critical path."""
+        seen = [("open-page", st.page)]
         try:
-            st = self.inspect(save_as="verify")
-            log.info("verification: registered=%s", st.registered)
-        except Exception as e:  # noqa: BLE001
-            log.warning("verification request failed: %s", e)
+            t0 = time.perf_counter()
+            res = self.sess.post(pages.build_submission(st.button))
+            log.info("register click -> %s in %.0f ms",
+                     "redirect " + res.redirect if res.redirect else f"HTTP {res.page.status}", res.elapsed_ms)
+            if res.redirect:
+                return Outcome.FAILED
+            seen.append(("register-response", res.page))
+            doc = res.page.doc()
+
+            reg_form = pages.form_by_id(doc, "regForm")
+            if reg_form is None:
+                return self._evaluate(doc)   # no confirmation page: maybe the result is shown directly
+            btn = pages.confirm_button(reg_form)
+            if btn is None:
+                log.error("confirmation page has no confirm button")
+                return Outcome.FAILED
+            fields = self._confirm_fields(reg_form)
+            if self.dry_run:
+                log.info("DRY RUN: confirmation page reached (button %r%s) - NOT confirming",
+                         btn.get("value"), f", fields {fields}" if fields else "")
+                return Outcome.DRY_RUN
+
+            res = self.sess.post(pages.build_submission(btn, fields))
+            log.info("confirm -> %s in %.0f ms (click + confirm: %.0f ms)",
+                     "redirect " + res.redirect if res.redirect else f"HTTP {res.page.status}",
+                     res.elapsed_ms, (time.perf_counter() - t0) * 1000)
+            if res.redirect:
+                return Outcome.FAILED
+            seen.append(("confirm-response", res.page))
+            return self._evaluate(res.page.doc())
+        finally:
+            for label, page in seen:
+                self.rec.save(label, page)
+
+    def _confirm_fields(self, reg_form: HtmlElement) -> dict[str, str]:
+        """Study code and exam slot selection on the confirmation page (only present if needed)."""
+        fields: dict[str, str] = {}
+        sc = pages.select_options(reg_form, "studyCode")
+        if sc:
+            name, opts = sc
+            if self.cfg.study_code:
+                if any(v == self.cfg.study_code for v, _ in opts):
+                    fields[name] = self.cfg.study_code
+                else:
+                    log.warning("study code %s not offered, keeping TISS default; options: %s",
+                                self.cfg.study_code, opts)
+            elif len(opts) > 1:
+                log.warning("several study codes offered, keeping TISS default: %s", opts)
+
+        sl = pages.select_options(reg_form, "subgrouplist")
+        if sl:
+            name, opts = sl
+            choice = None
+            if self.cfg.slot:
+                tokens = [x for x in re.split(r"[\s,\-–]+", self.cfg.slot) if x]
+                choice = next((v for v, txt in opts if all(tok in txt for tok in tokens)), None)
+                if choice is None:
+                    log.warning("slot %r not found, available: %s", self.cfg.slot, [t for _, t in opts])
+            if choice is None and opts:
+                choice = opts[0][0]
+                log.info("using the first available slot: %s", opts[0][1])
+            if choice is not None:
+                fields[name] = choice
+        return fields
+
+    def _evaluate(self, doc: HtmlElement) -> Outcome:
+        msg = pages.result_message(doc)
+        kind = pages.classify_result(msg) if msg else "unknown"
+        if msg:
+            log.info("TISS result: %s", msg)
+        else:
+            for m in pages.messages(doc):
+                log.info("TISS message: %s", m)
+        if kind == "prereg":
+            log.info("pre-registration recorded (the lecturer still has to confirm it)")
+        if kind in ("success", "prereg", "already"):
+            return Outcome.REGISTERED
+        if kind == "waitlist":
+            return Outcome.WAITLIST
+        return Outcome.FAILED

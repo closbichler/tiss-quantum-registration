@@ -1,7 +1,7 @@
 [project]
 name = "tiss-quantum-registration"
-version = "0.1.0"
-description = "TISS Quantum Registration - fast headless TISS (TU Wien) registration for LVAs, groups and exams"
+version = "0.2.0"
+description = "TISS Quantum Registration - fast headless TISS (TU Wien) registration for courses, groups and exams"
 requires-python = ">=3.11"
 dependencies = ["httpx>=0.27", "lxml>=5.0"]
 

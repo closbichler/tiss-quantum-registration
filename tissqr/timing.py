@@ -43,8 +43,11 @@ def measure_offset(head_fn, samples: int = 24, spacing: float = 0.07) -> ClockSy
         time.sleep(spacing + random.uniform(0, spacing))
     if ok < 3:
         return None
-    if lo > hi:  # inconsistent (several frontends with different clocks?)
-        log.warning("server clock samples inconsistent (lo=%.3f hi=%.3f), ignoring", lo, hi)
+    if lo > hi:
+        # The local clock moved during the measurement. Seen on WSL2: its clock runs a few %
+        # fast and gets stepped back by ~2s every now and then.
+        log.warning("server clock samples inconsistent (lo=%.3f hi=%.3f): the LOCAL clock is unstable "
+                    "(WSL/VM?) - timing will be off. Run on a machine with a stable, NTP-synced clock.", lo, hi)
         return None
     return ClockSync(offset=(lo + hi) / 2, error=(hi - lo) / 2, rtt=rtt)
 

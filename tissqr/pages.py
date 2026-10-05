@@ -12,6 +12,11 @@ from lxml.html import HtmlElement
 VIENNA = ZoneInfo("Europe/Vienna")
 _PARSER = lxml.html.HTMLParser(encoding="utf-8")
 
+# button labels (German / English UI)
+REGISTER = ("Anmelden", "Register", "Voranmeldung", "Voranmelden", "Preregistration")
+UNREGISTER = ("Abmelden", "Deregistration", "Unregister")
+CANCEL = ("Abbrechen", "Cancel", "Zurück", "Back")
+
 
 class PageError(Exception):
     """The page did not look like we expected."""
@@ -29,15 +34,8 @@ def _has_class(cls: str) -> str:
     return f"contains(concat(' ', normalize-space(@class), ' '), ' {cls} ')"
 
 
-def _closest(el: HtmlElement, cls: str) -> HtmlElement | None:
-    while el is not None:
-        if cls in (el.get("class") or "").split():
-            return el
-        el = el.getparent()
-    return None
-
-
 # --------------------------------------------------------------------------- course header
+#   <h1><span class="light">185.A62 </span>Präsentation und Moderation <small>(semester dropdown)</small></h1>
 
 def course_number(doc: HtmlElement) -> str:
     spans = doc.xpath("//*[@id='contentInner']//h1/span")
@@ -45,8 +43,8 @@ def course_number(doc: HtmlElement) -> str:
 
 
 def course_title(doc: HtmlElement) -> str:
-    h1 = doc.xpath("//*[@id='contentInner']//h1")
-    return norm(h1[0].text) if h1 else ""
+    spans = doc.xpath("//*[@id='contentInner']//h1/span")
+    return norm(spans[0].tail) if spans else ""
 
 
 def sub_header(doc: HtmlElement) -> str:
@@ -54,7 +52,9 @@ def sub_header(doc: HtmlElement) -> str:
     return norm(el[0].text_content()) if el else ""
 
 
-# --------------------------------------------------------------------------- options (groups/exams/lva)
+# --------------------------------------------------------------------------- options (course/groups/exams)
+# Every registration option is a <div class="groupWrapper"> with a header row
+# (name | status | seats), a details list (start/end of registration, ...) and the button.
 
 def wrappers(doc: HtmlElement) -> list[HtmlElement]:
     inner = doc.xpath("//*[@id='contentInner']")
@@ -68,25 +68,18 @@ def option_name(wrapper: HtmlElement) -> str:
 
 
 def option_header(wrapper: HtmlElement) -> str:
-    """Full header text, e.g. exam name + date."""
-    h = wrapper.xpath(f".//*[{_has_class('header_element')}]")
-    if h:
-        return norm(h[0].text_content())
-    h = wrapper.xpath(f".//*[{_has_class('groupHeaderWrapper')}]")
-    return norm(h[0].text_content()) if h else option_name(wrapper)
-
-
-def option_id(wrapper: HtmlElement) -> str:
-    """Stable-ish JSF id of an option, taken from its `...:members` span."""
-    for span in wrapper.xpath(".//span[contains(@id, 'members')]"):
-        m = re.search(r"Form:(.*):members", span.get("id"))
-        if m:
-            return m.group(1)
-    return ""
+    """Header row, e.g. 'Observers | Anmeldung möglich 16.09.26-02.03.27 | 0 / ∞'."""
+    head = wrapper.xpath(f".//*[{_has_class('groupHeaderWrapper')}]")
+    if not head:
+        return option_name(wrapper)
+    return " | ".join(t for t in (norm(el.text_content()) for el in head[0]) if t)
 
 
 def registration_start(wrapper: HtmlElement) -> datetime | None:
-    """Registration start shown on the option ("dd.mm.yyyy, HH:MM", Vienna time)."""
+    """Registration start shown on the option ("dd.mm.yyyy, HH:MM", Vienna time).
+
+    The span id ends with `:begin` (course page) or `:appBeginn` (group/exam page).
+    """
     for span in wrapper.xpath(".//span[contains(@id, 'egin')]"):
         m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4}),?\s+(\d{1,2}):(\d{2})", span.text_content())
         if m:
@@ -95,48 +88,28 @@ def registration_start(wrapper: HtmlElement) -> datetime | None:
     return None
 
 
-def find_option(doc: HtmlElement, kind: str, name: str = "", date: str = "",
-                opt_id: str = "") -> HtmlElement | None:
+def find_option(doc: HtmlElement, kind: str, name: str = "") -> HtmlElement | None:
+    """course: the only option on the page; group: exact name; exam: regex anywhere in the header row."""
     ws = wrappers(doc)
-    if opt_id:
-        for w in ws:
-            if option_id(w) == opt_id:
-                return w
-        return None
-    if kind == "lva":
-        # the LVA registration page has exactly one option
+    if kind == "course":
         return ws[0] if ws else None
     if kind == "group":
         want = norm(name).lower()
-        for w in ws:
-            if option_name(w).lower() == want:
-                return w
-        # fallback like the original userscript: any span in the header equals the name
-        for w in ws:
-            for span in w.xpath(f".//*[{_has_class('header_element')}]//span"):
-                if norm(span.text_content()).lower() == want:
-                    return _closest(span, "groupWrapper")
-        return None
+        return next((w for w in ws if option_name(w).lower() == want), None)
     if kind == "exam":
-        rx = re.compile(name, re.I) if name else None
-        for w in ws:
-            if rx and not rx.search(option_name(w)):
-                continue
-            if date and not (date in option_header(w) or re.search(date, option_header(w))):
-                continue
-            return w
-        return None
+        rx = re.compile(name, re.I)
+        return next((w for w in ws if rx.search(option_header(w))), None)
     raise ValueError(f"unknown registration type {kind!r}")
 
 
-def find_button(scope: HtmlElement | None, labels: list[str]) -> HtmlElement | None:
+def find_button(scope: HtmlElement | None, labels=REGISTER) -> HtmlElement | None:
     if scope is None:
         return None
     wanted = {norm(l).lower() for l in labels}
     for el in scope.iter("input", "button"):
         if el.tag == "input" and (el.get("type") or "").lower() not in ("submit", "button"):
             continue
-        # skip disabled buttons and the hidden "confirm deregistration" dialog button
+        # skip disabled buttons and the hidden "really deregister?" dialog button
         if el.get("disabled") is not None or "confirmOkBtn" in (el.get("id") or ""):
             continue
         label = el.get("value") if el.tag == "input" else (el.text_content() or el.get("value"))
@@ -146,6 +119,8 @@ def find_button(scope: HtmlElement | None, labels: list[str]) -> HtmlElement | N
 
 
 # --------------------------------------------------------------------------- confirm / result pages
+# Clicking "Anmelden" returns the confirmation page (form "regForm", action register.xhtml);
+# confirming it returns the result page (form "confirmForm" with a staticInfoMessage).
 
 def form_by_id(doc: HtmlElement, form_id: str) -> HtmlElement | None:
     for f in doc.forms:
@@ -155,13 +130,14 @@ def form_by_id(doc: HtmlElement, form_id: str) -> HtmlElement | None:
     return None
 
 
-def confirm_button(reg_form: HtmlElement, labels: list[str]) -> HtmlElement | None:
-    btn = find_button(reg_form, labels)
+def confirm_button(reg_form: HtmlElement) -> HtmlElement | None:
+    btn = find_button(reg_form)
     if btn is not None:
         return btn
     # fallback: the first submit input that is not a cancel button
+    cancel = {c.lower() for c in CANCEL}
     for el in reg_form.xpath(".//input[@type='submit']"):
-        if norm(el.get("value")).lower() not in ("abbrechen", "cancel", "zurück", "back"):
+        if norm(el.get("value")).lower() not in cancel:
             return el
     return None
 
@@ -225,7 +201,6 @@ def classify_result(text: str) -> str:
 class Submission:
     url: str
     data: list[tuple[str, str]]
-    button: str
 
 
 def enclosing_form(el: HtmlElement) -> HtmlElement | None:
@@ -238,16 +213,20 @@ def enclosing_form(el: HtmlElement) -> HtmlElement | None:
 def build_submission(button: HtmlElement, overrides: dict[str, str] | None = None) -> Submission:
     """Replicate a click on `button`: all successful form controls + the button itself.
 
-    This yields exactly what the browser sends, e.g. for a group:
+    This is exactly what the browser sends, e.g. for a group:
       groupContentForm_SUBMIT=1, jakarta.faces.ViewState=..., jakarta.faces.ClientWindow=...,
-      groupContentForm:j_id_..:j_id_a1=Anmelden
+      groupContentForm:j_id_55:0:j_id_5g:j_id_5j:2:j_id_a2=Anmelden
     """
     form = enclosing_form(button)
     if form is None:
         raise PageError(f"button {button.get('id')} is not inside a form")
     overrides = dict(overrides or {})
+    # lxml includes <input type="button"> (e.g. the dialog's confirmCancelBtn), a browser never sends it
+    skip = {el.get("name") for el in form.xpath(".//input[@type='button']")}
     data: list[tuple[str, str]] = []
     for name, value in form.form_values():
+        if name in skip:
+            continue
         if name in overrides:
             value = overrides.pop(name)
         data.append((name, value))
@@ -255,4 +234,4 @@ def build_submission(button: HtmlElement, overrides: dict[str, str] | None = Non
     name = button.get("name") or button.get("id")
     if name:
         data.append((name, button.get("value") or ""))
-    return Submission(url=form.action, data=data, button=name or "")
+    return Submission(url=form.action, data=data)

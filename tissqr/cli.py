@@ -1,4 +1,4 @@
-"""Command line interface: `tissqr check|run|clock`."""
+"""Command line interface: `tissqr check|run`."""
 from __future__ import annotations
 
 import argparse
@@ -8,102 +8,96 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__, config
-from .register import Recorder, Registrar
+from .pages import VIENNA
+from .register import Recorder, Registrar, fmt_start
 from .session import NotLoggedIn, TissSession, load_cookies
-from .timing import measure_offset
 
 log = logging.getLogger("tissqr")
 
 
-def setup_logging(log_dir: Path | None, verbose: bool) -> str:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    fmt = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+class ViennaFormatter(logging.Formatter):
+    """Log timestamps in Vienna time (= TISS time), whatever the machine's timezone is."""
+
+    def formatTime(self, record, datefmt=None):
+        return datetime.fromtimestamp(record.created, VIENNA).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def setup_logging(run_dir: Path, verbose: bool) -> None:
+    fmt = ViennaFormatter("%(asctime)s %(levelname)-7s %(message)s")
     log.setLevel(logging.DEBUG)
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
     console.setFormatter(fmt)
     log.addHandler(console)
-    if log_dir is not None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_dir / f"tissqr-{stamp}.log", encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        log.addHandler(fh)
-        log.info("logging to %s", fh.baseFilename)
-    return stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(run_dir / "run.log", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    log.info("logging to %s", run_dir)
 
 
-def _session(cfg: config.Config) -> TissSession:
-    cookies = load_cookies(cfg.cookies_file)
-    log.info("loaded %d cookies from %s: %s", len(cookies), cfg.cookies_file.name,
+def _setup(args) -> tuple[config.Config, TissSession, Recorder]:
+    cfg = config.load(args.config)
+    run_dir = cfg.log_dir / datetime.now(VIENNA).strftime("%Y%m%d-%H%M%S")
+    setup_logging(run_dir, args.verbose)
+    cookies = load_cookies(cfg.cookies)
+    log.info("loaded %d cookies from %s: %s", len(cookies), cfg.cookies.name,
              ", ".join(sorted({c.name for c in cookies})))
     missing = {"TISS_AUTH", "JSESSIONID", "_tiss_session"} - {c.name for c in cookies}
     if missing:
         log.warning("cookie(s) usually needed but missing: %s", ", ".join(sorted(missing)))
-    return TissSession(cookies, cfg.user_agent, cfg.timeout_s)
+    return cfg, TissSession(cookies), Recorder(run_dir)
 
 
 def cmd_check(args) -> int:
-    cfg = config.load(args.config)
-    stamp = setup_logging(cfg.log_dir, args.verbose)
-    sess = _session(cfg)
-    reg = Registrar(cfg, sess, Recorder(cfg.log_dir / stamp if cfg.save_html else None))
-    log.info("target: %s", cfg.target.describe())
-    st = reg.inspect(save_as="check")
+    cfg, sess, rec = _setup(args)
+    reg = Registrar(cfg, sess, rec)
+    log.info("target: %s", cfg.describe())
+    log.info("url: %s", cfg.url)
+    st = reg.inspect()
+    rec.save("check", st.page)
     ok = reg.report(st, list_all=True)
-    if cfg.schedule.start:
-        log.info("configured start: %s", cfg.schedule.start.isoformat())
+    if cfg.start:
+        log.info("start: %s (configured)", fmt_start(cfg.start))
+    elif st.start:
+        log.info("start: %s (from the page)", fmt_start(st.start))
+    else:
+        log.warning("start: unknown - set `start` in the config")
+        ok = False
     reg.clock_sync()
     log.info("check %s", "OK" if ok else "found problems (see warnings above)")
     return 0 if ok else 1
 
 
 def cmd_run(args) -> int:
-    cfg = config.load(args.config)
-    stamp = setup_logging(cfg.log_dir, args.verbose)
-    sess = _session(cfg)
-    reg = Registrar(cfg, sess, Recorder(cfg.log_dir / stamp if cfg.save_html else None),
-                    dry_run=args.dry_run)
+    cfg, sess, rec = _setup(args)
     if args.dry_run:
-        log.info("DRY RUN mode: %s", args.dry_run)
+        log.info("DRY RUN: will stop before the final confirmation")
     try:
-        return reg.run(now=args.now)
+        return Registrar(cfg, sess, rec, dry_run=args.dry_run).run(now=args.now)
     finally:
         sess.close()
 
 
-def cmd_clock(args) -> int:
-    setup_logging(None, args.verbose)
-    sess = TissSession([], config.DEFAULT_UA)
-    s = measure_offset(sess.head_root, samples=args.samples)
-    if s is None:
-        log.error("could not measure")
-        return 1
-    log.info("server - local = %+.3f s (+-%.3f s), best RTT %.1f ms", s.offset, s.error, s.rtt * 1000)
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-c", "--config", default="config.toml", help="config file (default: config.toml)")
+    common.add_argument("-v", "--verbose", action="store_true", help="debug output on the console")
+
     p = argparse.ArgumentParser(prog="tissqr", description="TISS Quantum Registration - fast headless TISS registration")
     p.add_argument("--version", action="version", version=__version__)
-    p.add_argument("-v", "--verbose", action="store_true", help="debug output on the console")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("check", help="read-only: verify cookies, course page and target option")
-    c.add_argument("-c", "--config", default="config.toml")
+    c = sub.add_parser("check", parents=[common],
+                       help="read-only: verify cookies, course page, target, start time and clock")
     c.set_defaults(func=cmd_check)
 
-    r = sub.add_parser("run", help="wait for the opening and register")
-    r.add_argument("-c", "--config", default="config.toml")
+    r = sub.add_parser("run", parents=[common], help="wait for the opening and register")
     r.add_argument("--now", action="store_true", help="ignore the start time and poll immediately")
-    r.add_argument("--dry-run", nargs="?", const="detect", choices=["detect", "confirm"],
-                   help="detect: stop when the register button appears (no POST at all); "
-                        "confirm: click register but stop before the final confirmation")
+    r.add_argument("--dry-run", action="store_true",
+                   help="click register but stop before the final (binding) confirmation")
     r.set_defaults(func=cmd_run)
-
-    k = sub.add_parser("clock", help="measure the TISS server clock offset (no login needed)")
-    k.add_argument("-n", "--samples", type=int, default=24)
-    k.set_defaults(func=cmd_clock)
 
     args = p.parse_args(argv)
     try:
