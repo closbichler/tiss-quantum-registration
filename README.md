@@ -45,7 +45,7 @@ Exit codes:
 4. **Register:** the first page with the `Anmelden` button sends the same form the browser would. The confirmation follows immediately; logging and saving pages wait until it is sent. If TISS rejects the click, another page from the opening is used, without a new reload.
 5. **Result:** *"Sie wurden erfolgreich … angemeldet."* → exit code `0`; the waiting list → exit code `3`.
 
-In the quiet test on 2026-10-05 the click took 30–130 ms and the confirmation 55–680 ms. At a real opening (2026-10-06, 22 groups opening at once) they took 0.3 s and 1.7 s. TISS is slow during the rush, so every millisecond before the click counts.
+On courses with few participants the whole registration takes 80-800ms. On courses with many participants (tested with ~200 participant course, all registering at the same time) the registration took 2-3s, because TISS slows down during the rush.
 
-**Status:** tested with course and group registrations that were already open, and with one real opening (which ended on the waiting list). Not tested yet: exams (slots, study code). 
+**Status:** tested with course and group registrations. Not tested yet: exams (slots, study code). 
 Automated use may conflict with TU Wien's IT usage policies; use at your own risk.
