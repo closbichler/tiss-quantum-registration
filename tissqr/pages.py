@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -10,7 +11,7 @@ import lxml.html
 from lxml.html import HtmlElement
 
 VIENNA = ZoneInfo("Europe/Vienna")
-_PARSER = lxml.html.HTMLParser(encoding="utf-8")
+_local = threading.local()   # one parser per thread: a shared lxml parser parses one page at a time
 
 REGISTER = ("Anmelden", "Register", "Voranmeldung", "Voranmelden", "Preregistration")
 UNREGISTER = ("Abmelden", "Deregistration", "Unregister")
@@ -26,7 +27,10 @@ def norm(s: str | None) -> str:
 
 
 def parse(content: bytes, url: str) -> HtmlElement:
-    return lxml.html.document_fromstring(content, parser=_PARSER, base_url=url)
+    parser = getattr(_local, "parser", None)
+    if parser is None:
+        parser = _local.parser = lxml.html.HTMLParser(encoding="utf-8")
+    return lxml.html.document_fromstring(content, parser=parser, base_url=url)
 
 
 def _has_class(cls: str) -> str:
@@ -53,12 +57,14 @@ def wrappers(doc: HtmlElement) -> list[HtmlElement]:
     """Each option (course, group, exam) is a div.groupWrapper: header row, details, button."""
     inner = doc.xpath("//*[@id='contentInner']")
     root = inner[0] if inner else doc
-    return root.xpath(f".//*[{_has_class('groupWrapper')}]")
+    # a plain contains() first: half the time of matching the exact class in XPath (this runs on every reload)
+    return [el for el in root.xpath(".//*[contains(@class, 'groupWrapper')]")
+            if "groupWrapper" in el.get("class", "").split()]
 
 
 def option_name(wrapper: HtmlElement) -> str:
-    span = wrapper.xpath(".//span")
-    return norm(span[0].text_content()) if span else ""
+    span = next(wrapper.iter("span"), None)
+    return norm(span.text_content()) if span is not None else ""
 
 
 def option_header(wrapper: HtmlElement) -> str:
@@ -167,15 +173,17 @@ WAITLIST_RE = re.compile(r"warteliste|waiting list", re.I)
 
 
 def classify_result(text: str) -> str:
-    """Map the TISS result message to success|prereg|already|waitlist|unknown."""
+    """Map the TISS result message to waitlist|prereg|success|already|unknown.
+
+    The waiting list comes first: its message also says "Ihr Anmeldewunsch ... wurde erfasst"."""
+    if WAITLIST_RE.search(text):
+        return "waitlist"
     if PREREG_RE.search(text):
         return "prereg"
     if SUCCESS_RE.search(text):
         return "success"
     if ALREADY_RE.search(text):
         return "already"
-    if WAITLIST_RE.search(text):
-        return "waitlist"
     return "unknown"
 
 

@@ -72,6 +72,8 @@ def check(args) -> int:
             log.info("✔ registration opens %s (%s), in %s", fmt_start(start),
                      "from the config" if cfg.start else "from TISS", fmt_duration(start.timestamp() - time.time()))
     reg.clock_sync()
+    if st.option is not None:
+        reg.probe_parallel()
 
     run = "tissqr run" + ("" if args.config == "config.toml" else f" {args.config}")
     if ok:

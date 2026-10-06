@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,10 @@ HOST = "tiss.tuwien.ac.at"
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/140.0.0.0 Safari/537.36")
 TIMEOUT_S = 20.0
+CLOCK_URL = BASE + "/robots.txt"   # a static file: TISS answers it faster than any page
+IDLE_S = 4.0         # TISS closes connections idle for ~5 s; never reuse one that old
+# a kept-alive connection that turned out to be closed: the request never reached TISS's application
+STALE = (httpx.RemoteProtocolError, httpx.WriteError, httpx.ConnectError)
 
 _STUB_RE = re.compile(r"var redirectUrl\s*=\s*'([^']*)'")
 
@@ -104,6 +109,7 @@ def _js_unescape(s: str) -> str:
 
 
 class TissSession:
+    """Thread-safe: around the opening several requests run at the same time."""
     MAX_HOPS = 8
 
     def __init__(self, cookies: list[CookieSpec], transport: httpx.BaseTransport | None = None):
@@ -111,7 +117,7 @@ class TissSession:
             transport=transport,
             follow_redirects=False,
             timeout=httpx.Timeout(TIMEOUT_S, connect=10.0),
-            limits=httpx.Limits(max_keepalive_connections=2, keepalive_expiry=120),
+            limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=IDLE_S),
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -119,7 +125,8 @@ class TissSession:
             },
         )
         for c in cookies:
-            self.client.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+            if not c.name.startswith("dsrwid-"):   # the browser's window cookies; each request brings its own
+                self.client.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
         self.window_id = str(random.randint(1000, 9999))
 
     def close(self) -> None:
@@ -131,22 +138,32 @@ class TissSession:
         s = urlsplit(url)
         if s.hostname != HOST or not s.path.endswith(".xhtml"):
             return url
-        rid = str(random.randint(0, 998))
-        jar = self.client.cookies.jar
-        for c in list(jar):
-            if c.name.startswith("dsrwid-"):
-                jar.clear(c.domain, c.path, c.name)
-        self.client.cookies.set(f"dsrwid-{rid}", self.window_id, domain=HOST, path="/")
-        return set_query(url, dsrid=rid, dswid=self.window_id)
+        return set_query(url, dsrid=str(random.randint(0, 998)), dswid=self.window_id)
+
+    def _send(self, req: httpx.Request) -> httpx.Response:
+        try:
+            return self.client.send(req)
+        except STALE:
+            return self.client.send(req)   # once more, on a fresh connection
+
+    def _get(self, url: str) -> httpx.Response:
+        url = self._tokenize(url)
+        req = self.client.build_request("GET", url)
+        q = dict(parse_qsl(urlsplit(url).query))
+        if "dsrid" in q:
+            # the dsrwid cookie goes into this request only, not into the shared cookie jar
+            c = f"dsrwid-{q['dsrid']}={q.get('dswid', '')}"
+            req.headers["Cookie"] = f"{req.headers['Cookie']}; {c}" if "Cookie" in req.headers else c
+        return self._send(req)
 
     def get(self, url: str) -> Page:
         """GET a TISS page, following redirects and window-handler stubs (normally: one round trip)."""
         t0 = time.perf_counter()
-        resp = self.client.get(self._tokenize(url))
+        resp = self._get(url)
         for _ in range(self.MAX_HOPS):
             url = str(resp.url)
             if resp.is_redirect:
-                resp = self.client.get(self._tokenize(urljoin(url, resp.headers["location"])))
+                resp = self._get(urljoin(url, resp.headers["location"]))
                 continue
             if urlsplit(url).hostname != HOST:
                 raise NotLoggedIn(f"redirected to {url.split('?')[0]}")
@@ -155,7 +172,7 @@ class TissSession:
             if b"handleWindowId" in resp.content[:20000] or b"handleWindowId" in resp.content[-2000:]:
                 m = _STUB_RE.search(resp.text)
                 if m:
-                    resp = self.client.get(self._tokenize(urljoin(BASE, _js_unescape(m.group(1)))))
+                    resp = self._get(urljoin(BASE, _js_unescape(m.group(1))))
                     continue
             return Page(url, resp.status_code, resp.content, (time.perf_counter() - t0) * 1000)
         raise pages.PageError("too many redirects")
@@ -163,15 +180,29 @@ class TissSession:
     def post(self, sub: pages.Submission) -> PostResult:
         """POST a form. TISS answers 200 on success; any redirect means the request was rejected."""
         t0 = time.perf_counter()
-        resp = self.client.post(sub.url, content=urlencode(sub.data),
-                                headers={"Content-Type": "application/x-www-form-urlencoded",
-                                         "Origin": BASE, "Referer": sub.url})
+        resp = self._send(self.client.build_request(
+            "POST", sub.url, content=urlencode(sub.data),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": BASE, "Referer": sub.url}))
         ms = (time.perf_counter() - t0) * 1000
         if resp.is_redirect:
             return PostResult(None, urljoin(str(resp.url), resp.headers.get("location", "")), ms)
         return PostResult(Page(str(resp.url), resp.status_code, resp.content, ms), None, ms)
 
-    def head_root(self) -> tuple[httpx.Response, float, float]:
+    def head_clock(self) -> tuple[httpx.Response, float, float]:
         t0 = time.time()
-        r = self.client.head(BASE + "/")
+        r = self.client.head(CLOCK_URL)
         return r, t0, time.time()
+
+    def warm(self, n: int) -> None:
+        """Open n connections at once, so that n parallel requests right after don't wait for a
+        TCP and TLS handshake (about three round trips)."""
+        def head():
+            try:
+                self.client.head(CLOCK_URL)
+            except httpx.HTTPError:
+                pass
+        threads = [threading.Thread(target=head, daemon=True) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()

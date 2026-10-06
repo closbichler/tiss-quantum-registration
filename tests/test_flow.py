@@ -8,12 +8,16 @@ Run: .venv/bin/python -m unittest discover -s tests -v
 from __future__ import annotations
 
 import logging
+import math
+import random
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs
 
 import httpx
@@ -22,7 +26,7 @@ from tissqr import config, pages, register
 from tissqr.pages import VIENNA
 from tissqr.register import Recorder, Registrar
 from tissqr.session import BASE, NotLoggedIn, TissSession, load_cookies
-from tissqr.timing import ClockSync
+from tissqr.timing import ClockError, ClockSync, measure_offset
 
 STUB = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html><html><head><title>Loading...</title></head><body>
@@ -118,10 +122,14 @@ def confirm_page(vs: str, wid: str, selects: bool) -> str:
 </form></div></body></html>"""
 
 
-def result_page(what: str) -> str:
+WAITLIST_MSG = ('Ihr Anmeldewunsch zur Gruppe "Teil 2 - 192-05-04" wurde erfasst, es sind jedoch keine regulären '
+                'Plätze mehr frei. Sie wurden in die Warteliste der Gruppe aufgenommen.')   # live, 2026-10-06
+
+
+def result_page(message: str) -> str:
     return f"""<!DOCTYPE html><html><body><div id="contentInner">
 <form id="confirmForm" name="confirmForm" method="post" action="/education/course/register.xhtml">
-<div class="staticInfoMessage">Sie wurden erfolgreich zur {what} angemeldet.
+<div class="staticInfoMessage">{message}
 </div>
 <input id="confirmForm:j_id_3c" name="confirmForm:j_id_3c" type="submit" value="Ok" class="primaryButton">
 </form></div></body></html>"""
@@ -133,19 +141,25 @@ class MockTiss:
                                                             'Lehrveranstaltung "Einführung in die Programmierung 1"')}
 
     def __init__(self, open_after_polls: int = 2, opens_at: float = 0.0, logged_in: bool = True,
-                 selects: bool = False, reject_clicks: int = 0):
+                 selects: bool = False, reject_clicks: int = 0, waitlist: bool = False,
+                 delay: float = 0.0, serial: bool = False):
         self.polls = 0
         self.open_after = open_after_polls
         self.opens_at = opens_at
         self.logged_in = logged_in
         self.selects = selects
         self.reject_clicks = reject_clicks
+        self.waitlist = waitlist
+        self.delay = delay     # time TISS needs to build a page
+        self.serial = serial   # build pages one after the other instead of in parallel
         self.registered = False
         self.vs_n = 0
         self.valid_vs: set[str] = set()
         self.confirm_body: dict | None = None
         self.stubs_served = 0
         self.log: list[tuple[float, str, str, bool]] = []   # (time, method, path, open?)
+        self.lock = threading.Lock()
+        self.serial_lock = threading.Lock()
 
     def _vs(self) -> str:
         self.vs_n += 1
@@ -157,6 +171,20 @@ class MockTiss:
         return self.polls > self.open_after and time.time() >= self.opens_at
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
+        page = req.url.path in self.PAGES   # reload or click: TISS builds the group page or the confirmation
+        if self.serial and page:
+            with self.serial_lock:
+                return self._respond(req, page)
+        return self._respond(req, page)
+
+    def _respond(self, req: httpx.Request, page: bool) -> httpx.Response:
+        with self.lock:
+            resp = self._handle(req)
+        if page and self.delay:
+            time.sleep(self.delay)
+        return resp
+
+    def _handle(self, req: httpx.Request) -> httpx.Response:
         path = req.url.path
         self.log.append((time.time(), req.method, path, self.is_open()))
         if req.method == "HEAD":
@@ -200,8 +228,13 @@ class MockTiss:
                 return httpx.Response(302, headers={"location": "/education/error.xhtml?errorCode=badRequest"})
             self.confirm_body = body
             self.registered = True
-            return httpx.Response(200, text=result_page(self.what))
+            return httpx.Response(200, text=result_page(
+                WAITLIST_MSG if self.waitlist else f"Sie wurden erfolgreich zur {self.what} angemeldet."))
         return httpx.Response(404)
+
+    def requests(self, method: str) -> list[tuple[float, bool]]:
+        """(arrival time, open?) of all GETs or POSTs to the registration pages."""
+        return [(t, o) for t, m, p, o in self.log if m == method and p != "/robots.txt"]
 
 
 def make_cfg(tmp: Path, **settings) -> config.Config:
@@ -313,6 +346,80 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(len(syncs), 1)
         self.assertAlmostEqual(syncs[0], opens_at - 0.5, delta=0.1)
 
+    def test_waiting_list(self):
+        mock = MockTiss(open_after_polls=0, waitlist=True)
+        self.assertEqual(self.registrar(mock).run(), 3)
+
+    def timed(self, mock: MockTiss, measured: float, error: float):
+        """A registrar whose clock sync says TISS opens at `measured`, ±error."""
+        reg = self.registrar(mock, start=datetime.fromtimestamp(measured, VIENNA).isoformat())
+        reg.sync = ClockSync(0.0, error, 0.002)
+        return reg
+
+    def test_burst_covers_clock_uncertainty(self):
+        """TISS opens 30 ms later than measured (uncertainty ±40 ms). The reloads around the opening
+        go out without waiting for each other, one arrives right after the real opening, one registers."""
+        measured = time.time() + 2.0
+        mock = MockTiss(open_after_polls=0, opens_at=measured + 0.03, delay=0.1)
+        self.assertEqual(self.timed(mock, measured, 0.04).run(), 0)
+        gets = mock.requests("GET")
+        burst = [t for t, _ in gets if measured - 0.01 <= t <= measured + 0.08]
+        self.assertEqual(len(burst), 4, "4 parallel reloads, although each takes 100 ms")
+        first_open = min(t for t, o in gets if o)
+        self.assertLess(first_open - mock.opens_at, register.ARRIVE_MARGIN_S + register.BURST_STEP_S + 0.01)
+        self.assertEqual(len(mock.requests("POST")), 2, "exactly one click and one confirmation")
+        self.assertTrue(mock.registered)
+
+    def test_spare_page_after_rejected_click(self):
+        """A rejected click is retried with another page of the burst, without a new reload."""
+        measured = time.time() + 2.0
+        mock = MockTiss(open_after_polls=0, opens_at=measured - 0.01, delay=0.05, reject_clicks=1)
+        self.assertEqual(self.timed(mock, measured, 0.04).run(), 0)
+        self.assertTrue(mock.registered)
+        self.assertEqual(len([1 for _, o in mock.requests("GET") if o]), 3,
+                         "the 4th reload is skipped (registering), no new reload after the rejection")
+
+    def test_parallel_reloads(self):
+        """Parallel reloads each bring their own window cookie, so none gets the loading stub."""
+        mock = MockTiss(delay=0.05)
+        reg = self.registrar(mock)
+        found = []
+        threads = [threading.Thread(target=lambda: found.append(reg.inspect().option is not None)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(found, [True] * 4)
+        self.assertEqual(mock.stubs_served, 0)
+        self.assertFalse([c for c in reg.sess.client.cookies.jar if c.name.startswith("dsrwid-")])
+
+    def test_probe_parallel(self):
+        for serial in (False, True):
+            reg = self.registrar(MockTiss(delay=0.15, serial=serial))
+            reg.probe_parallel()
+            self.assertEqual(reg.parallel, not serial)
+
+    def test_clock_advice(self):
+        reg = self.registrar(MockTiss())
+        old = register.measure_offset
+        try:
+            register.measure_offset = lambda head: ClockSync(37.7, 0.012, 0.038)
+            with self.assertLogs("tissqr", logging.INFO) as cm:
+                reg.clock_sync()
+                reg.clock_sync()
+            out = "\n".join(cm.output)
+            self.assertIn("37.70 s behind the TISS clock - this is compensated (±12 ms)", out)
+            self.assertIn("network round trip to TISS: 38 ms - a server in or near Vienna", out)
+            self.assertEqual(out.count("37.7 s off - it's compensated, but turn on time sync"), 1)
+
+            register.measure_offset = lambda head: ClockSync(-0.004, 0.006, 0.011)
+            with self.assertLogs("tissqr", logging.INFO) as cm:
+                reg.clock_sync()
+            self.assertEqual([r.levelname for r in cm.records], ["INFO", "INFO"])
+            self.assertIn("network round trip to TISS: 11 ms", cm.output[1])
+        finally:
+            register.measure_offset = old
+
 
 class ParseTest(unittest.TestCase):
     def doc(self, html: str):
@@ -363,6 +470,7 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(pages.classify_result(
             'Sie wurden erfolgreich zur Lehrveranstaltung "Präsentation und Moderation" angemeldet.'), "success")
         self.assertEqual(pages.classify_result("You are on the waiting list"), "waitlist")
+        self.assertEqual(pages.classify_result(WAITLIST_MSG), "waitlist")
         self.assertEqual(pages.classify_result(
             "Ihr Anmeldewunsch für X wurde erfasst. Erst nach Bestätigung durch ..."), "prereg")
 
@@ -376,6 +484,67 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(load_cookies(tmp / "b.json")[0].value, "z")
         c = load_cookies(tmp / "c.txt")
         self.assertEqual([(x.name, x.path) for x in c], [("JSESSIONID", "/education"), ("TISS_AUTH", "/")])
+
+
+class FakeServer:
+    """A simulated clock and TISS `Date` header: TISS is `offset` s ahead, each way takes `latency` + jitter."""
+
+    def __init__(self, offset: float, latency: float, jitter: float = 0.0, jump_after: int = 0):
+        self.t = 1_791_000_000.123   # real time; the local clock shows t + skew, TISS t + offset
+        self.skew = 0.0
+        self.offset, self.latency, self.jitter = offset, latency, jitter
+        self.jump_after = jump_after
+        self.n = 0
+        self.rnd = random.Random(7)
+
+    def now(self) -> float:
+        return self.t + self.skew
+
+    def wait(self, until: float) -> None:
+        self.t = max(self.t, until - self.skew)
+
+    def head(self):
+        self.n += 1
+        if self.jump_after and self.n == self.jump_after:
+            self.skew -= 2.0   # the local clock is stepped back
+        t0 = self.now()
+        self.t += self.latency + self.rnd.uniform(0, self.jitter)
+        server = datetime.fromtimestamp(math.floor(self.t + self.offset), timezone.utc)
+        self.t += self.latency + self.rnd.uniform(0, self.jitter)
+        return SimpleNamespace(headers={"date": format_datetime(server, usegmt=True)}), t0, self.now()
+
+
+class TimingTest(unittest.TestCase):
+    def measure(self, srv: FakeServer) -> ClockSync:
+        return measure_offset(srv.head, clock=srv.now, wait=srv.wait)
+
+    def test_clock_offset_within_half_round_trip(self):
+        for offset, latency in ((37.6834, 0.011), (-1.1607, 0.002), (0.4999, 0.03)):
+            srv = FakeServer(offset, latency, jitter=0.002)
+            start = srv.t
+            s = self.measure(srv)
+            self.assertLessEqual(abs(s.offset - offset), s.error)
+            self.assertLess(s.error, 1.2 * latency + 0.005,
+                            f"±{s.error * 1000:.1f} ms for a {2 * latency * 1000:.0f} ms round trip")
+            self.assertAlmostEqual(s.rtt, 2 * latency, delta=0.004)
+            self.assertLess(srv.t - start, 6.1)
+
+    def test_clock_jump(self):
+        with self.assertRaisesRegex(ClockError, "unstable"):
+            self.measure(FakeServer(0.3, 0.01, jump_after=5))
+
+    def test_burst_offsets(self):
+        m, step = register.ARRIVE_MARGIN_S, register.BURST_STEP_S
+        self.assertEqual(register.burst_offsets(0.0), [m])
+        self.assertEqual(register.burst_offsets(0.005), [m + 0.005])   # one reload is enough
+        self.assertEqual(register.burst_offsets(0.03, parallel=False), [m + 0.03])
+        self.assertEqual(len(register.burst_offsets(0.5)), register.BURST_MAX)
+        for error in (0.005, 0.012, 0.03, 0.05, 0.08):
+            offsets = register.burst_offsets(error)
+            n = len(offsets)
+            for real in (error * k / 10 for k in range(-10, 11)):   # where the opening really is
+                first = min(o for o in offsets if o >= real + m - 1e-9)
+                self.assertLessEqual(first - real, m + max(step, 2 * error / n) + 1e-9, (error, real, offsets))
 
 
 class ConfigTest(unittest.TestCase):
